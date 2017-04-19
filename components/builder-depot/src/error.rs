@@ -23,20 +23,26 @@ use hab_core;
 use hab_core::package::{self, Identifiable};
 use hab_net;
 use hyper;
+use protocol::net::NetError;
 use redis;
 
 #[derive(Debug)]
 pub enum Error {
     BadPort(String),
+    ChannelAlreadyExists(String),
+    ChannelDoesNotExist(String),
     DataStore(dbcache::Error),
     HabitatCore(hab_core::Error),
     HabitatNet(hab_net::Error),
     HTTP(hyper::status::StatusCode),
     InvalidPackageIdent(String),
     IO(io::Error),
+    MessageTypeNotFound,
     NoXFilename,
     NoFilePart,
     NulError(ffi::NulError),
+    PackageIsAlreadyInChannel(String, String),
+    ProtocolNetError(NetError),
     RemotePackageNotFound(package::PackageIdent),
     WriteSyncFailed,
 }
@@ -47,6 +53,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let msg = match *self {
             Error::BadPort(ref e) => format!("{} is an invalid port. Valid range 1-65535.", e),
+            Error::ChannelAlreadyExists(ref e) => format!("{} already exists.", e),
+            Error::ChannelDoesNotExist(ref e) => format!("{} does not exist.", e),
             Error::DataStore(ref e) => format!("DataStore error, {}", e),
             Error::HabitatCore(ref e) => format!("{}", e),
             Error::HabitatNet(ref e) => format!("{}", e),
@@ -57,14 +65,17 @@ impl fmt::Display for Error {
                         e)
             }
             Error::IO(ref e) => format!("{}", e),
-            Error::NoXFilename => {
-                format!("Invalid download from a Depot - missing X-Filename header")
-            }
+            Error::MessageTypeNotFound => format!("Unable to find message for given type"),
+            Error::NoXFilename => format!("Invalid download from a Depot - missing X-Filename header"),
             Error::NoFilePart => {
                 format!("An invalid path was passed - we needed a filename, and this path does \
                          not have one")
             }
             Error::NulError(ref e) => format!("{}", e),
+            Error::PackageIsAlreadyInChannel(ref p, ref c) => {
+                format!("{} is already in the {} channel.", p, c)
+            }
+            Error::ProtocolNetError(ref e) => format!("{}", e),
             Error::RemotePackageNotFound(ref pkg) => {
                 if pkg.fully_qualified() {
                     format!("Cannot find package in any sources: {}", pkg)
@@ -72,9 +83,7 @@ impl fmt::Display for Error {
                     format!("Cannot find a release of package in any sources: {}", pkg)
                 }
             }
-            Error::WriteSyncFailed => {
-                format!("Could not write to destination; perhaps the disk is full?")
-            }
+            Error::WriteSyncFailed => format!("Could not write to destination; perhaps the disk is full?"),
         };
         write!(f, "{}", msg)
     }
@@ -84,25 +93,22 @@ impl error::Error for Error {
     fn description(&self) -> &str {
         match *self {
             Error::BadPort(_) => "Received an invalid port or a number outside of the valid range.",
+            Error::ChannelAlreadyExists(_) => "Channel already exists.",
+            Error::ChannelDoesNotExist(_) => "Channel does not exist.",
             Error::DataStore(ref err) => err.description(),
             Error::HabitatCore(ref err) => err.description(),
             Error::HabitatNet(ref err) => err.description(),
             Error::HTTP(_) => "Received an HTTP error",
-            Error::InvalidPackageIdent(_) => {
-                "Package identifiers must be in origin/name format (example: acme/redis)"
-            }
+            Error::InvalidPackageIdent(_) => "Package identifiers must be in origin/name format (example: acme/redis)",
             Error::IO(ref err) => err.description(),
-            Error::NulError(_) => {
-                "An attempt was made to build a CString with a null byte inside it"
-            }
+            Error::NulError(_) => "An attempt was made to build a CString with a null byte inside it",
+            Error::PackageIsAlreadyInChannel(_, _) => "Package is already in channel",
+            Error::ProtocolNetError(ref err) => err.description(),
             Error::RemotePackageNotFound(_) => "Cannot find a package in any sources",
             Error::NoXFilename => "Invalid download from a Depot - missing X-Filename header",
-            Error::NoFilePart => {
-                "An invalid path was passed - we needed a filename, and this path does not have one"
-            }
-            Error::WriteSyncFailed => {
-                "Could not write to destination; bytes written was 0 on a non-0 buffer"
-            }
+            Error::NoFilePart => "An invalid path was passed - we needed a filename, and this path does not have one",
+            Error::MessageTypeNotFound => "Unable to find message for given type",
+            Error::WriteSyncFailed => "Could not write to destination; bytes written was 0 on a non-0 buffer",
         }
     }
 }
@@ -141,5 +147,11 @@ impl From<io::Error> for Error {
 impl From<hab_net::Error> for Error {
     fn from(err: hab_net::Error) -> Error {
         Error::HabitatNet(err)
+    }
+}
+
+impl From<NetError> for Error {
+    fn from(err: NetError) -> Error {
+        Error::ProtocolNetError(err)
     }
 }

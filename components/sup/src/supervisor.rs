@@ -18,26 +18,30 @@
 /// spawning the new process, watching for failure, and ensuring the service is either up or down.
 /// If the process dies, the supervisor will restart it.
 
+use std;
+use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::path::PathBuf;
 use std::process::Child;
 use std::result;
+use std::sync::{Arc, RwLock};
 use std::thread;
 
-use hcore;
 use hcore::os::process::{HabChild, ExitStatusExt};
-use hcore::package::PackageIdent;
+use hcore::util::perm::set_owner;
+use hcore::package::PackageInstall;
 use hcore::service::ServiceGroup;
 use serde::{Serialize, Serializer};
+use serde::ser::SerializeStruct;
 use time::SteadyTime;
 
 use error::{Result, Error};
+use fs;
 use util;
 
-const PIDFILE_NAME: &'static str = "PID";
 static LOGKEY: &'static str = "SV";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -62,19 +66,34 @@ impl fmt::Display for ProcessState {
 
 /// Additional params used to start the Supervisor.
 /// These params are outside the scope of what is in
-/// Supervisor.package_ident, and aren't runtime params that are stored
+/// Supervisor.package.ident, and aren't runtime params that are stored
 /// in the top-level Supervisor struct (such as PID etc)
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub svc_user: String,
     pub svc_group: String,
+    pub env_vars: HashMap<String, String>,
 }
 
 impl RuntimeConfig {
-    pub fn new(svc_user: String, svc_group: String) -> RuntimeConfig {
+    pub fn new(svc_user: String,
+               svc_group: String,
+               env_vars: HashMap<String, String>)
+               -> RuntimeConfig {
         RuntimeConfig {
             svc_user: svc_user,
             svc_group: svc_group,
+            env_vars: env_vars,
+        }
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> RuntimeConfig {
+        RuntimeConfig {
+            svc_user: util::users::DEFAULT_USER.to_string(),
+            svc_group: util::users::DEFAULT_GROUP.to_string(),
+            env_vars: HashMap::new(),
         }
     }
 }
@@ -82,7 +101,7 @@ impl RuntimeConfig {
 #[derive(Debug)]
 pub struct Supervisor {
     pub child: Option<HabChild>,
-    pub package_ident: PackageIdent,
+    pub package: Arc<RwLock<PackageInstall>>,
     pub preamble: String,
     pub state: ProcessState,
     pub state_entered: SteadyTime,
@@ -91,13 +110,13 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(package_ident: PackageIdent,
+    pub fn new(package: Arc<RwLock<PackageInstall>>,
                service_group: &ServiceGroup,
                runtime_config: RuntimeConfig)
                -> Supervisor {
         Supervisor {
             child: None,
-            package_ident: package_ident,
+            package: package,
             preamble: format!("{}", service_group),
             state: ProcessState::Down,
             state_entered: SteadyTime::now(),
@@ -125,23 +144,28 @@ impl Supervisor {
 
     pub fn start(&mut self) -> Result<()> {
         if self.child.is_none() {
+            debug!("Setting PATH for {} to PATH='{}'",
+                   &self.preamble,
+                   self.runtime_config
+                       .env_vars
+                       .get("PATH")
+                       .map(|v| &**v)
+                       .unwrap_or("<unknown>"));
             outputln!(preamble self.preamble,
                       "Starting process as user={}, group={}",
                       &self.runtime_config.svc_user,
                       &self.runtime_config.svc_group);
             self.enter_state(ProcessState::Start);
-            let mut child = try!(util::create_command(self.run_cmd(),
-                                                      &self.runtime_config.svc_user,
-                                                      &self.runtime_config.svc_group)
-                .spawn());
+            let mut child = try!(try!(util::create_command(self.run_cmd(), &self.runtime_config))
+                                     .spawn());
 
             let hab_child = try!(HabChild::from(&mut child));
             self.child = Some(hab_child);
             try!(self.create_pidfile());
             let package_name = self.preamble.clone();
             try!(thread::Builder::new()
-                .name(String::from("sup-service-read"))
-                .spawn(move || -> Result<()> { child_reader(&mut child, package_name) }));
+                     .name(String::from("sup-service-read"))
+                     .spawn(move || -> Result<()> { child_reader(&mut child, package_name) }));
             self.enter_state(ProcessState::Up);
             self.has_started = true;
         } else {
@@ -241,11 +265,19 @@ impl Supervisor {
     }
 
     pub fn service_dir(&self) -> PathBuf {
-        hcore::fs::svc_path(&self.package_ident.name)
+        fs::svc_path(&self.package
+                          .read()
+                          .expect("Package lock poisoned")
+                          .ident()
+                          .name)
     }
 
     pub fn pid_file(&self) -> PathBuf {
-        self.service_dir().join(PIDFILE_NAME)
+        fs::svc_pid_file(&self.package
+                              .read()
+                              .expect("Package lock poisoned")
+                              .ident()
+                              .name)
     }
 
     /// Create a pid file for a package
@@ -259,7 +291,10 @@ impl Supervisor {
                 debug!("Creating PID file for child {} -> {:?}",
                        pid_file.display(),
                        pid);
-                let mut f = try!(File::create(pid_file));
+                let mut f = try!(File::create(&pid_file));
+                try!(set_owner(pid_file,
+                               &self.runtime_config.svc_user,
+                               &self.runtime_config.svc_group));
                 try!(write!(f, "{}", pid));
                 Ok(())
             }
@@ -272,7 +307,7 @@ impl Supervisor {
     pub fn cleanup_pidfile(&self) {
         let pid_file = self.pid_file();
         debug!("Attempting to clean up pid file {}", &pid_file.display());
-        match fs::remove_file(pid_file) {
+        match std::fs::remove_file(pid_file) {
             Ok(_) => {
                 debug!("Removed pid file");
             }
@@ -305,23 +340,26 @@ impl Supervisor {
 }
 
 impl Serialize for Supervisor {
-    fn serialize<S>(&self, serializer: &mut S) -> result::Result<(), S::Error>
+    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
         where S: Serializer
     {
         let pid = match self.child {
             Some(ref child) => Some(child.id()),
             None => None,
         };
-        let mut state = try!(serializer.serialize_struct("supervisor", 7));
-        try!(serializer.serialize_struct_elt(&mut state, "pid", &pid));
-        try!(serializer.serialize_struct_elt(&mut state, "package", &self.package_ident));
-        try!(serializer.serialize_struct_elt(&mut state, "preamble", &self.preamble));
-        try!(serializer.serialize_struct_elt(&mut state, "state", &self.state));
-        try!(serializer.serialize_struct_elt(&mut state, "state_entered",
-            &self.state_entered.to_string()));
-        try!(serializer.serialize_struct_elt(&mut state, "started", &self.has_started));
-        try!(serializer.serialize_struct_elt(&mut state, "runtime_config", &self.runtime_config));
-        serializer.serialize_struct_end(state)
+        let mut strukt = try!(serializer.serialize_struct("supervisor", 7));
+        try!(strukt.serialize_field("pid", &pid));
+        try!(strukt.serialize_field("package",
+                                    &self.package
+                                         .read()
+                                         .expect("Package lock poisoned")
+                                         .to_string()));
+        try!(strukt.serialize_field("preamble", &self.preamble));
+        try!(strukt.serialize_field("state", &self.state));
+        try!(strukt.serialize_field("state_entered", &self.state_entered.to_string()));
+        try!(strukt.serialize_field("started", &self.has_started));
+        try!(strukt.serialize_field("runtime_config", &self.runtime_config));
+        strukt.end()
     }
 }
 

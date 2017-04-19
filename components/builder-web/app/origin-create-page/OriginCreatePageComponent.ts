@@ -16,13 +16,11 @@ import {FormControl, FormGroup, FormBuilder, Validators} from "@angular/forms";
 import {AfterViewInit, Component, OnInit} from "@angular/core";
 import {AppStore} from "../AppStore";
 import {AsyncValidator} from "../AsyncValidator";
-import {CheckingInputComponent} from "../CheckingInputComponent";
 import {createOrigin} from "../actions/index";
 import {BuilderApiClient} from "../BuilderApiClient";
 import {requireSignIn} from "../util";
 
 @Component({
-    directives: [CheckingInputComponent],
     template: `
     <div class="hab-origin-create">
         <div class="page-title">
@@ -67,10 +65,11 @@ import {requireSignIn} from "../util";
 })
 
 export class OriginCreatePageComponent implements AfterViewInit, OnInit {
+    form: FormGroup;
+    isOriginAvailable: Function;
+    maxLength = 255;
+
     private builderApiClient: BuilderApiClient;
-    private form: FormGroup;
-    private isOriginAvailable: Function;
-    private maxLength = 255;
     private name: FormControl;
 
     constructor(private formBuilder: FormBuilder, private store: AppStore) {
@@ -102,7 +101,7 @@ export class OriginCreatePageComponent implements AfterViewInit, OnInit {
         requireSignIn(this);
     }
 
-    private createOrigin(origin) {
+    createOrigin(origin) {
         this.store.dispatch(createOrigin(
             origin,
             this.store.getState().gitHub.authToken,

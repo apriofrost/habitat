@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::error;
 use std::fmt;
 use std::io;
-use std::str;
+use std::path::PathBuf;
 use std::result;
+use std::str;
 
 use habitat_core;
 use protobuf;
@@ -28,12 +28,15 @@ pub type Result<T> = result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
+    BadDataPath(PathBuf, io::Error),
+    BadDatFile(PathBuf, io::Error),
     BadMessage(String),
     CannotBind(io::Error),
+    DatFileIO(PathBuf, io::Error),
     HabitatCore(habitat_core::error::Error),
     NonExistentRumor(String, String),
     ProtobufError(protobuf::ProtobufError),
-    ServiceConfigDecode(String, Vec<toml::ParserError>),
+    ServiceConfigDecode(String, toml::de::Error),
     ServiceConfigNotUtf8(String, str::Utf8Error),
     SocketSetReadTimeout(io::Error),
     SocketSetWriteTimeout(io::Error),
@@ -45,8 +48,23 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let msg = match *self {
+            Error::BadDataPath(ref path, ref err) => {
+                format!("Unable to read or write to data directory, {}, {}",
+                        path.display(),
+                        err)
+            }
+            Error::BadDatFile(ref path, ref err) => {
+                format!("Unable to decode contents of DatFile, {}, {}",
+                        path.display(),
+                        err)
+            }
             Error::BadMessage(ref err) => format!("Bad Message: {:?}", err),
             Error::CannotBind(ref err) => format!("Cannot bind to port: {:?}", err),
+            Error::DatFileIO(ref path, ref err) => {
+                format!("Error reading or writing to DatFile, {}, {}",
+                        path.display(),
+                        err)
+            }
             Error::HabitatCore(ref err) => format!("{}", err),
             Error::NonExistentRumor(ref member_id, ref rumor_id) => {
                 format!("Non existent rumor asked to be written to bytes: {} {}",
@@ -80,12 +98,13 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn description(&self) -> &str {
         match *self {
+            Error::BadDataPath(_, _) => "Unable to read or write to data directory",
+            Error::BadDatFile(_, _) => "Unable to decode contents of DatFile",
             Error::BadMessage(_) => "Bad Protobuf Message; should be Ping/Ack/PingReq",
             Error::CannotBind(_) => "Cannot bind to port",
+            Error::DatFileIO(_, _) => "Error reading or writing to DatFile",
             Error::HabitatCore(_) => "Habitat core error",
-            Error::NonExistentRumor(_, _) => {
-                "Cannot write rumor to bytes because it does not exist"
-            }
+            Error::NonExistentRumor(_, _) => "Cannot write rumor to bytes because it does not exist",
             Error::ProtobufError(ref err) => err.description(),
             Error::ServiceConfigDecode(_, _) => "Cannot decode service config into TOML",
             Error::ServiceConfigNotUtf8(_, _) => "Cannot read service config bytes to UTF-8",

@@ -15,6 +15,7 @@
 pub mod archive;
 pub mod ident;
 pub mod install;
+pub mod metadata;
 pub mod plan;
 pub mod target;
 
@@ -24,44 +25,15 @@ pub use self::install::PackageInstall;
 pub use self::plan::Plan;
 pub use self::target::{Target, PackageTarget};
 
-use std::fmt;
+#[cfg(test)]
+pub mod test_support {
+    use std::path::PathBuf;
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub enum MetaFile {
-    CFlags,
-    Config,
-    Deps,
-    TDeps,
-    Exports,
-    Exposes,
-    Ident,
-    LdRunPath,
-    LdFlags,
-    Manifest,
-    Path,
-    SvcUser,
-    SvcGroup,
-    Target,
-}
-
-impl fmt::Display for MetaFile {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let id = match *self {
-            MetaFile::CFlags => "CFLAGS",
-            MetaFile::Config => "default.toml",
-            MetaFile::Deps => "DEPS",
-            MetaFile::TDeps => "TDEPS",
-            MetaFile::Exports => "EXPORTS",
-            MetaFile::Exposes => "EXPOSES",
-            MetaFile::Ident => "IDENT",
-            MetaFile::LdRunPath => "LD_RUN_PATH",
-            MetaFile::LdFlags => "LDFLAGS",
-            MetaFile::Manifest => "MANIFEST",
-            MetaFile::Path => "PATH",
-            MetaFile::SvcUser => "SVC_USER",
-            MetaFile::SvcGroup => "SVC_GROUP",
-            MetaFile::Target => "TARGET",
-        };
-        write!(f, "{}", id)
+    pub fn fixture_path(name: &str) -> PathBuf {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name);
+        path
     }
 }

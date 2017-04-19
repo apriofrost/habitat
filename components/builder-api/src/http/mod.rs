@@ -51,12 +51,6 @@ pub fn router(config: Arc<Config>) -> Result<Chain> {
         user_invitations: get "/user/invitations" => {
             XHandler::new(list_account_invitations).before(basic.clone())
         },
-        edit_user_invitation: put "/user/invitations/:invitation_id" => {
-            XHandler::new(accept_invitation).before(basic.clone())
-        },
-        delete_user_invitation: delete "/user/invitations/:invitation_id" => {
-            XHandler::new(ignore_invitation).before(basic.clone())
-        },
         user_origins: get "/user/origins" => XHandler::new(list_user_origins).before(basic.clone()),
 
         projects: post "/projects" => XHandler::new(project_create).before(bldr.clone()),
@@ -70,8 +64,7 @@ pub fn router(config: Arc<Config>) -> Result<Chain> {
     );
     let mut chain = Chain::new(router);
     chain.link(persistent::Read::<GitHubCli>::both(GitHubClient::new(&*config)));
-    chain.link(Read::<EventLog>::both(EventLogger::new("hab-builder-api", config.events_enabled)));
-
+    chain.link(Read::<EventLog>::both(EventLogger::new(&config.log_dir, config.events_enabled)));
     chain.link_before(RouteBroker);
     chain.link_after(Cors);
     Ok(chain)
@@ -92,7 +85,7 @@ pub fn run(config: Arc<Config>) -> Result<JoinHandle<()>> {
     let (tx, rx) = mpsc::sync_channel(1);
 
     let addr = config.http_addr.clone();
-    let depot = try!(depot::Depot::new(config.depot.clone()));
+    let depot = depot::DepotUtil::new(config.depot.clone());
     let depot_chain = try!(depot::server::router(depot));
 
     let mut mount = Mount::new();
@@ -106,11 +99,11 @@ pub fn run(config: Arc<Config>) -> Result<JoinHandle<()>> {
     let handle = thread::Builder::new()
         .name("http-srv".to_string())
         .spawn(move || {
-            let mut server = Iron::new(mount);
-            server.threads = HTTP_THREAD_COUNT;
-            server.http(addr).unwrap();
-            tx.send(()).unwrap();
-        })
+                   let mut server = Iron::new(mount);
+                   server.threads = HTTP_THREAD_COUNT;
+                   server.http(addr).unwrap();
+                   tx.send(()).unwrap();
+               })
         .unwrap();
     match rx.recv() {
         Ok(()) => Ok(handle),

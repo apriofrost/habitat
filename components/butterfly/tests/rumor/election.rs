@@ -25,9 +25,9 @@ fn three_members_run_election() {
     net.add_service(1, "core/witcher/1.2.3/20161208121212");
     net.add_service(2, "core/witcher/1.2.3/20161208121212");
 
-    net.add_election(0, "witcher", 0);
-    net.add_election(1, "witcher", 0);
-    net.add_election(2, "witcher", 0);
+    net.add_election(0, "witcher");
+    net.add_election(1, "witcher");
+    net.add_election(2, "witcher");
 
     assert_wait_for_election_status!(net, [0..3], "witcher.prod", Election_Status::Finished);
     assert_wait_for_equal_election!(net, [0..3, 0..3], "witcher.prod");
@@ -40,7 +40,7 @@ fn three_members_run_election_from_one_starting_rumor() {
     net.add_service(0, "core/witcher/1.2.3/20161208121212");
     net.add_service(1, "core/witcher/1.2.3/20161208121212");
     net.add_service(2, "core/witcher/1.2.3/20161208121212");
-    net.add_election(0, "witcher", 0);
+    net.add_election(0, "witcher");
     assert_wait_for_election_status!(net, [0..3], "witcher.prod", Election_Status::Finished);
     assert_wait_for_equal_election!(net, [0..3, 0..3], "witcher.prod");
 }
@@ -51,7 +51,7 @@ fn two_members_fail_to_find_quorum() {
     net.mesh();
     net.add_service(0, "core/witcher/1.2.3/20161208121212");
     net.add_service(1, "core/witcher/1.2.3/20161208121212");
-    net.add_election(0, "witcher", 0);
+    net.add_election(0, "witcher");
     assert_wait_for_equal_election!(net, [0..2, 0..2], "witcher.prod");
     assert_wait_for_election_status!(net, [0..2], "witcher.prod", Election_Status::NoQuorum);
 }
@@ -62,11 +62,11 @@ fn two_members_find_quorum_when_a_third_comes() {
     net.mesh();
     net.add_service(0, "core/witcher/1.2.3/20161208121212");
     net.add_service(1, "core/witcher/1.2.3/20161208121212");
-    net.add_election(0, "witcher", 0);
+    net.add_election(0, "witcher");
     assert_wait_for_equal_election!(net, [0..2, 0..2], "witcher.prod");
     assert_wait_for_election_status!(net, [0..2], "witcher.prod", Election_Status::NoQuorum);
 
-    net.members.push(btest::start_server("2", None));
+    net.members.push(btest::start_server("2", None, 0));
     net.add_service(2, "core/witcher/1.2.3/20161208121212");
     net.connect(2, 0);
     assert_wait_for_election_status!(net, [0..2], "witcher.prod", Election_Status::Finished);
@@ -82,14 +82,16 @@ fn five_members_elect_a_new_leader_when_the_old_one_dies() {
     net.add_service(2, "core/witcher/1.2.3/20161208121212");
     net.add_service(3, "core/witcher/1.2.3/20161208121212");
     net.add_service(4, "core/witcher/1.2.3/20161208121212");
-    net.add_election(0, "witcher", 0);
+    net.add_election(0, "witcher");
     assert_wait_for_election_status!(net, [0..5], "witcher.prod", Election_Status::Finished);
     assert_wait_for_equal_election!(net, [0..5, 0..5], "witcher.prod");
 
     let mut leader_id = String::from("");
-    net[0].election_store.with_rumor("witcher.prod",
-                                     "election",
-                                     |e| { leader_id = String::from(e.unwrap().get_member_id()); });
+    net[0]
+        .election_store
+        .with_rumor("witcher.prod",
+                    "election",
+                    |e| { leader_id = String::from(e.unwrap().get_member_id()); });
 
     let mut paused = 0;
     for (index, server) in net.iter_mut().enumerate() {
@@ -119,29 +121,41 @@ fn five_members_elect_a_new_leader_when_the_old_one_dies() {
     }
 
     if paused == 0 {
-        net[1].election_store.with_rumor("witcher.prod", "election", |e| {
-            assert!(e.unwrap().get_term() == 1);
-            assert!(e.unwrap().get_member_id() != paused_id);
-        });
+        net[1]
+            .election_store
+            .with_rumor("witcher.prod", "election", |e| {
+                assert!(e.unwrap().get_term() == 1);
+                assert!(e.unwrap().get_member_id() != paused_id);
+            });
     } else {
-        net[0].election_store.with_rumor("witcher.prod", "election", |e| {
-            assert!(e.unwrap().get_term() == 1);
-            assert!(e.unwrap().get_member_id() != paused_id);
-        });
+        net[0]
+            .election_store
+            .with_rumor("witcher.prod", "election", |e| {
+                assert!(e.unwrap().get_term() == 1);
+                assert!(e.unwrap().get_member_id() != paused_id);
+            });
     }
 }
 
 #[test]
 fn five_members_elect_a_new_leader_when_they_are_quorum_partitioned() {
-    let mut net = btest::SwimNet::new(5);
-    net[0].member.write().expect("Member lock is poisoned").set_persistent(true);
-    net[4].member.write().expect("Member lock is poisoned").set_persistent(true);
+    let mut net = btest::SwimNet::new_with_suitability(vec![1, 0, 0, 0, 0]);
+    net[0]
+        .member
+        .write()
+        .expect("Member lock is poisoned")
+        .set_persistent(true);
+    net[4]
+        .member
+        .write()
+        .expect("Member lock is poisoned")
+        .set_persistent(true);
     net.add_service(0, "core/witcher/1.2.3/20161208121212");
     net.add_service(1, "core/witcher/1.2.3/20161208121212");
     net.add_service(2, "core/witcher/1.2.3/20161208121212");
     net.add_service(3, "core/witcher/1.2.3/20161208121212");
     net.add_service(4, "core/witcher/1.2.3/20161208121212");
-    net.add_election(0, "witcher", 1);
+    net.add_election(0, "witcher");
     net.connect(0, 1);
     net.connect(1, 2);
     net.connect(2, 3);
@@ -151,9 +165,11 @@ fn five_members_elect_a_new_leader_when_they_are_quorum_partitioned() {
     assert_wait_for_equal_election!(net, [0..5, 0..5], "witcher.prod");
 
     let mut leader_id = String::from("");
-    net[0].election_store.with_rumor("witcher.prod",
-                                     "election",
-                                     |e| { leader_id = String::from(e.unwrap().get_member_id()); });
+    net[0]
+        .election_store
+        .with_rumor("witcher.prod",
+                    "election",
+                    |e| { leader_id = String::from(e.unwrap().get_member_id()); });
 
     assert_eq!(leader_id, net[0].member_id());
 
@@ -175,14 +191,18 @@ fn five_members_elect_a_new_leader_when_they_are_quorum_partitioned() {
     assert_wait_for_election_status!(net, 2, "witcher.prod", Election_Status::Finished);
     assert_wait_for_election_status!(net, 3, "witcher.prod", Election_Status::Finished);
     assert_wait_for_election_status!(net, 4, "witcher.prod", Election_Status::Finished);
-    net[0].election_store.with_rumor("witcher.prod", "election", |e| {
-        println!("OLD: {:#?}", e);
-        new_leader_id = String::from(e.unwrap().get_member_id());
-    });
-    net[2].election_store.with_rumor("witcher.prod", "election", |e| {
-        println!("NEW: {:#?}", e);
-        new_leader_id = String::from(e.unwrap().get_member_id());
-    });
+    net[0]
+        .election_store
+        .with_rumor("witcher.prod", "election", |e| {
+            println!("OLD: {:#?}", e);
+            new_leader_id = String::from(e.unwrap().get_member_id());
+        });
+    net[2]
+        .election_store
+        .with_rumor("witcher.prod", "election", |e| {
+            println!("NEW: {:#?}", e);
+            new_leader_id = String::from(e.unwrap().get_member_id());
+        });
     assert!(leader_id != new_leader_id);
     println!("Leader {} New {}", leader_id, new_leader_id);
     net.unpartition(0..2, 2..5);
@@ -190,12 +210,16 @@ fn five_members_elect_a_new_leader_when_they_are_quorum_partitioned() {
     assert_wait_for_election_status!(net, 0, "witcher.prod", Election_Status::Finished);
     assert_wait_for_election_status!(net, 1, "witcher.prod", Election_Status::Finished);
 
-    net[4].election_store.with_rumor("witcher.prod", "election", |e| {
-        println!("MAJORITY: {:#?}", e);
-    });
+    net[4]
+        .election_store
+        .with_rumor("witcher.prod", "election", |e| {
+            println!("MAJORITY: {:#?}", e);
+        });
 
-    net[0].election_store.with_rumor("witcher.prod", "election", |e| {
-        println!("MINORITY: {:#?}", e);
-        assert_eq!(new_leader_id, String::from(e.unwrap().get_member_id()));
-    });
+    net[0]
+        .election_store
+        .with_rumor("witcher.prod", "election", |e| {
+            println!("MINORITY: {:#?}", e);
+            assert_eq!(new_leader_id, String::from(e.unwrap().get_member_id()));
+        });
 }

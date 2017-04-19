@@ -19,115 +19,120 @@
 //! protocol), expire (turning Suspect members into Confirmed members), push (the fan-out rumors),
 //! and pull (the inbound receipt of rumors.).
 
-pub mod expire;
-pub mod inbound;
-pub mod outbound;
-pub mod pull;
-pub mod push;
+mod expire;
+mod inbound;
+mod outbound;
+mod pull;
+mod push;
 pub mod timing;
 
 use std::collections::{HashSet, HashMap};
-use std::fmt;
+use std::ffi;
+use std::fmt::{self, Debug};
+use std::fs;
 use std::io;
 use std::net::{ToSocketAddrs, UdpSocket, SocketAddr};
+use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::channel;
-use std::time::Duration;
+use std::time::{Instant, Duration};
 use std::thread;
 
 use habitat_core::service::ServiceGroup;
 use habitat_core::crypto::SymKey;
 use serde::{Serialize, Serializer};
+use serde::ser::SerializeStruct;
 use toml;
 
 use error::{Result, Error};
 use member::{Member, Health, MemberList};
-use trace::{Trace, TraceKind};
-use rumor::{Rumor, RumorStore, RumorList, RumorKey};
+use message;
+use rumor::{Rumor, RumorList, RumorKey, RumorStore};
+use rumor::dat_file::DatFile;
 use rumor::service::Service;
 use rumor::service_config::ServiceConfig;
 use rumor::service_file::ServiceFile;
 use rumor::election::{Election, ElectionUpdate};
-use message;
+use trace::{Trace, TraceKind};
+
+pub trait Suitability: Debug + Send + Sync {
+    fn get(&self, service_group: &ServiceGroup) -> u64;
+}
 
 /// The server struct. Is thread-safe.
 #[derive(Debug, Clone)]
 pub struct Server {
-    pub name: Arc<String>,
-    pub member_id: Arc<String>,
+    name: Arc<String>,
+    member_id: Arc<String>,
     pub member: Arc<RwLock<Member>>,
     pub member_list: MemberList,
-    pub ring_key: Arc<Option<SymKey>>,
-    pub rumor_list: RumorList,
+    ring_key: Arc<Option<SymKey>>,
+    rumor_list: RumorList,
     pub service_store: RumorStore<Service>,
     pub service_config_store: RumorStore<ServiceConfig>,
     pub service_file_store: RumorStore<ServiceFile>,
     pub election_store: RumorStore<Election>,
     pub update_store: RumorStore<ElectionUpdate>,
-    pub swim_addr: Arc<RwLock<SocketAddr>>,
-    pub gossip_addr: Arc<RwLock<SocketAddr>>,
+    swim_addr: Arc<RwLock<SocketAddr>>,
+    gossip_addr: Arc<RwLock<SocketAddr>>,
+    suitability_lookup: Arc<Box<Suitability>>,
+    data_path: Arc<Option<PathBuf>>,
+    dat_file: Arc<RwLock<Option<DatFile>>>,
     // These are all here for testing support
-    pub pause: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     pub trace: Arc<RwLock<Trace>>,
-    pub swim_rounds: Arc<AtomicIsize>,
-    pub gossip_rounds: Arc<AtomicIsize>,
-    pub blacklist: Arc<RwLock<HashSet<String>>>,
-}
-
-impl Serialize for Server {
-    fn serialize<S>(&self, serializer: &mut S) -> result::Result<(), S::Error>
-        where S: Serializer
-    {
-        let mut state = try!(serializer.serialize_struct("butterfly", 5));
-        try!(serializer.serialize_struct_elt(&mut state, "service", &self.service_store));
-        try!(serializer.serialize_struct_elt(&mut state,
-                                             "service_config",
-                                             &self.service_config_store));
-        try!(serializer.serialize_struct_elt(&mut state, "service_file", &self.service_file_store));
-        try!(serializer.serialize_struct_elt(&mut state, "election", &self.election_store));
-        try!(serializer.serialize_struct_elt(&mut state, "election_update", &self.update_store));
-        serializer.serialize_struct_end(state)
-    }
+    swim_rounds: Arc<AtomicIsize>,
+    gossip_rounds: Arc<AtomicIsize>,
+    blacklist: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Server {
     /// Create a new server, bound to the `addr`, hosting a particular `member`, and with a
     /// `Trace` struct, a ring_key if you want encryption on the wire, and an optional server name.
-    pub fn new<A: ToSocketAddrs>(swim_addr: A,
-                                 gossip_addr: A,
-                                 member: Member,
-                                 trace: Trace,
-                                 ring_key: Option<SymKey>,
-                                 name: Option<String>)
-                                 -> Result<Server> {
+    pub fn new<T, U, P>(swim_addr: T,
+                        gossip_addr: U,
+                        member: Member,
+                        trace: Trace,
+                        ring_key: Option<SymKey>,
+                        name: Option<String>,
+                        data_path: Option<P>,
+                        suitability_lookup: Box<Suitability>)
+                        -> Result<Server>
+        where T: ToSocketAddrs,
+              U: ToSocketAddrs,
+              P: Into<PathBuf> + AsRef<ffi::OsStr>
+    {
         let maybe_swim_socket_addr = swim_addr.to_socket_addrs().map(|mut iter| iter.next());
         let maybe_gossip_socket_addr = gossip_addr.to_socket_addrs().map(|mut iter| iter.next());
 
         match (maybe_swim_socket_addr, maybe_gossip_socket_addr) {
             (Ok(Some(swim_socket_addr)), Ok(Some(gossip_socket_addr))) => {
                 Ok(Server {
-                    name: Arc::new(name.unwrap_or(String::from(member.get_id()))),
-                    member_id: Arc::new(String::from(member.get_id())),
-                    member: Arc::new(RwLock::new(member)),
-                    member_list: MemberList::new(),
-                    ring_key: Arc::new(ring_key),
-                    rumor_list: RumorList::default(),
-                    service_store: RumorStore::default(),
-                    service_config_store: RumorStore::default(),
-                    service_file_store: RumorStore::default(),
-                    election_store: RumorStore::default(),
-                    update_store: RumorStore::default(),
-                    swim_addr: Arc::new(RwLock::new(swim_socket_addr)),
-                    gossip_addr: Arc::new(RwLock::new(gossip_socket_addr)),
-                    pause: Arc::new(AtomicBool::new(false)),
-                    trace: Arc::new(RwLock::new(trace)),
-                    swim_rounds: Arc::new(AtomicIsize::new(0)),
-                    gossip_rounds: Arc::new(AtomicIsize::new(0)),
-                    blacklist: Arc::new(RwLock::new(HashSet::new())),
-                })
+                       name: Arc::new(name.unwrap_or(String::from(member.get_id()))),
+                       member_id: Arc::new(String::from(member.get_id())),
+                       member: Arc::new(RwLock::new(member)),
+                       member_list: MemberList::new(),
+                       ring_key: Arc::new(ring_key),
+                       rumor_list: RumorList::default(),
+                       service_store: RumorStore::default(),
+                       service_config_store: RumorStore::default(),
+                       service_file_store: RumorStore::default(),
+                       election_store: RumorStore::default(),
+                       update_store: RumorStore::default(),
+                       swim_addr: Arc::new(RwLock::new(swim_socket_addr)),
+                       gossip_addr: Arc::new(RwLock::new(gossip_socket_addr)),
+                       suitability_lookup: Arc::new(suitability_lookup),
+                       data_path: Arc::new(data_path.as_ref().map(|p| p.into())),
+                       dat_file: Arc::new(RwLock::new(None)),
+                       pause: Arc::new(AtomicBool::new(false)),
+                       trace: Arc::new(RwLock::new(trace)),
+                       swim_rounds: Arc::new(AtomicIsize::new(0)),
+                       gossip_rounds: Arc::new(AtomicIsize::new(0)),
+                       blacklist: Arc::new(RwLock::new(HashSet::new())),
+                   })
             }
             (Err(e), _) | (_, Err(e)) => Err(Error::CannotBind(e)),
             (Ok(None), _) | (_, Ok(None)) => {
@@ -147,7 +152,7 @@ impl Server {
     }
 
     /// Adds 1 to the current round, atomically.
-    pub fn update_swim_round(&self) {
+    fn update_swim_round(&self) {
         let current_round = self.swim_rounds.load(Ordering::SeqCst);
         match current_round.checked_add(1) {
             Some(_number) => {
@@ -171,7 +176,7 @@ impl Server {
     }
 
     /// Adds 1 to the current round, atomically.
-    pub fn update_gossip_round(&self) {
+    fn update_gossip_round(&self) {
         let current_round = self.gossip_rounds.load(Ordering::SeqCst);
         match current_round.checked_add(1) {
             Some(_number) => {
@@ -193,29 +198,44 @@ impl Server {
     /// * Returns `Error::CannotBind` if the socket cannot be bound
     /// * Returns `Error::SocketSetReadTimeout` if the socket read timeout cannot be set
     /// * Returns `Error::SocketSetWriteTimeout` if the socket write timeout cannot be set
-    pub fn start(&self, timing: timing::Timing) -> Result<()> {
+    pub fn start(&mut self, timing: timing::Timing) -> Result<()> {
         let (tx_outbound, rx_inbound) = channel();
+        if let Some(ref path) = *self.data_path {
+            if let Some(err) = fs::create_dir_all(path).err() {
+                return Err(Error::BadDataPath(path.to_path_buf(), err));
+            }
+            let mut file = DatFile::new(&self.member_id, path);
+            if file.path().exists() {
+                file.read_into(self)?;
+            }
+            let mut dat_file = self.dat_file.write().expect("DatFile lock is poisoned");
+            *dat_file = Some(file);
+        }
 
-        let socket =
-            match UdpSocket::bind(*self.swim_addr.read().expect("Swim address lock is poisoned")) {
-                Ok(socket) => socket,
-                Err(e) => return Err(Error::CannotBind(e)),
-            };
-        try!(socket.set_read_timeout(Some(Duration::from_millis(1000)))
-            .map_err(|e| Error::SocketSetReadTimeout(e)));
-        try!(socket.set_write_timeout(Some(Duration::from_millis(1000)))
-            .map_err(|e| Error::SocketSetReadTimeout(e)));
-
+        let socket = match UdpSocket::bind(*self.swim_addr
+                                                .read()
+                                                .expect("Swim address lock is poisoned")) {
+            Ok(socket) => socket,
+            Err(e) => return Err(Error::CannotBind(e)),
+        };
+        try!(socket
+                 .set_read_timeout(Some(Duration::from_millis(1000)))
+                 .map_err(|e| Error::SocketSetReadTimeout(e)));
+        try!(socket
+                 .set_write_timeout(Some(Duration::from_millis(1000)))
+                 .map_err(|e| Error::SocketSetReadTimeout(e)));
 
         let server_a = self.clone();
         let socket_a = match socket.try_clone() {
             Ok(socket_a) => socket_a,
             Err(_) => return Err(Error::SocketCloneError),
         };
-        let _ = thread::Builder::new().name(format!("inbound-{}", self.name())).spawn(move || {
-            inbound::Inbound::new(&server_a, socket_a, tx_outbound).run();
-            panic!("You should never, ever get here, judy");
-        });
+        let _ = thread::Builder::new()
+            .name(format!("inbound-{}", self.name()))
+            .spawn(move || {
+                       inbound::Inbound::new(server_a, socket_a, tx_outbound).run();
+                       panic!("You should never, ever get here, judy");
+                   });
 
         let server_b = self.clone();
         let socket_b = match socket.try_clone() {
@@ -223,59 +243,82 @@ impl Server {
             Err(_) => return Err(Error::SocketCloneError),
         };
         let timing_b = timing.clone();
-        let _ = thread::Builder::new().name(format!("outbound-{}", self.name())).spawn(move || {
-            outbound::Outbound::new(&server_b, socket_b, rx_inbound, timing_b).run();
-            panic!("You should never, ever get here, bob");
-        });
+        let _ = thread::Builder::new()
+            .name(format!("outbound-{}", self.name()))
+            .spawn(move || {
+                       outbound::Outbound::new(server_b, socket_b, rx_inbound, timing_b).run();
+                       panic!("You should never, ever get here, bob");
+                   });
 
         let server_c = self.clone();
         let timing_c = timing.clone();
-        let _ = thread::Builder::new().name(format!("expire-{}", self.name())).spawn(move || {
-            expire::Expire::new(&server_c, timing_c).run();
-            panic!("You should never, ever get here, frank");
-        });
+        let _ = thread::Builder::new()
+            .name(format!("expire-{}", self.name()))
+            .spawn(move || {
+                       expire::Expire::new(server_c, timing_c).run();
+                       panic!("You should never, ever get here, frank");
+                   });
 
         let server_d = self.clone();
-        let _ = thread::Builder::new().name(format!("pull-{}", self.name())).spawn(move || {
-            pull::Pull::new(&server_d).run();
-            panic!("You should never, ever get here, davey");
-        });
+        let _ = thread::Builder::new()
+            .name(format!("pull-{}", self.name()))
+            .spawn(move || {
+                       pull::Pull::new(server_d).run();
+                       panic!("You should never, ever get here, davey");
+                   });
 
         let server_e = self.clone();
-        let _ = thread::Builder::new().name(format!("push-{}", self.name())).spawn(move || {
-            push::Push::new(&server_e, timing).run();
-            panic!("You should never, ever get here, liu");
-        });
+        let _ = thread::Builder::new()
+            .name(format!("push-{}", self.name()))
+            .spawn(move || {
+                       push::Push::new(server_e, timing).run();
+                       panic!("You should never, ever get here, liu");
+                   });
+
+        if self.dat_file
+               .read()
+               .expect("DatFile lock poisoned")
+               .is_some() {
+            let server_f = self.clone();
+            let _ = thread::Builder::new()
+                .name(format!("persist-{}", self.name()))
+                .spawn(move || {
+                           persist_loop(server_f);
+                           panic!("Data persistence loop unexpectedly quit!");
+                       });
+        }
 
         Ok(())
     }
 
     /// Blacklist a given address, causing no traffic to be seen.
     pub fn add_to_blacklist(&self, member_id: String) {
-        let mut blacklist = self.blacklist.write().expect("Write lock for blacklist is poisoned");
+        let mut blacklist = self.blacklist
+            .write()
+            .expect("Write lock for blacklist is poisoned");
         blacklist.insert(member_id);
     }
 
     /// Remove a given address from the blacklist.
     pub fn remove_from_blacklist(&self, member_id: &str) {
-        let mut blacklist = self.blacklist.write().expect("Write lock for blacklist is poisoned");
+        let mut blacklist = self.blacklist
+            .write()
+            .expect("Write lock for blacklist is poisoned");
         blacklist.remove(member_id);
     }
 
     /// Check that a given address is on the blacklist.
-    pub fn check_blacklist(&self, member_id: &str) -> bool {
-        let blacklist = self.blacklist.write().expect("Write lock for blacklist is poisoned");
+    fn check_blacklist(&self, member_id: &str) -> bool {
+        let blacklist = self.blacklist
+            .write()
+            .expect("Write lock for blacklist is poisoned");
         blacklist.contains(member_id)
     }
 
     /// Stop the outbound and inbound threads from processing work.
     pub fn pause(&mut self) {
-        self.pause.compare_and_swap(false, true, Ordering::Relaxed);
-    }
-
-    /// Allow the outbound and inbound threads to process work.
-    pub fn unpause(&mut self) {
-        self.pause.compare_and_swap(true, false, Ordering::Relaxed);
+        self.pause
+            .compare_and_swap(false, true, Ordering::Relaxed);
     }
 
     /// Whether this server is currently paused.
@@ -284,26 +327,35 @@ impl Server {
     }
 
     /// Return the swim address we are bound to
-    pub fn swim_addr(&self) -> SocketAddr {
-        let sa = self.swim_addr.read().expect("Swim Address lock poisoned");
+    fn swim_addr(&self) -> SocketAddr {
+        let sa = self.swim_addr
+            .read()
+            .expect("Swim Address lock poisoned");
         sa.clone()
     }
 
-
     /// Return the port number of the swim socket we are bound to.
     pub fn swim_port(&self) -> u16 {
-        self.swim_addr.read().expect("Swim Address lock poisoned").port()
+        self.swim_addr
+            .read()
+            .expect("Swim Address lock poisoned")
+            .port()
     }
 
     /// Return the gossip address we are bound to
     pub fn gossip_addr(&self) -> SocketAddr {
-        let ga = self.gossip_addr.read().expect("Gossip Address lock poisoned");
+        let ga = self.gossip_addr
+            .read()
+            .expect("Gossip Address lock poisoned");
         ga.clone()
     }
 
     /// Return the port number of the gossip socket we are bound to.
     pub fn gossip_port(&self) -> u16 {
-        self.gossip_addr.read().expect("Gossip Address lock poisoned").port()
+        self.gossip_addr
+            .read()
+            .expect("Gossip Address lock poisoned")
+            .port()
     }
 
     /// Return the member ID of this server.
@@ -335,27 +387,8 @@ impl Server {
         }
     }
 
-    /// Change the health of a `Member`, and update its `RumorKey`.
-    pub fn insert_health(&self, member: &Member, health: Health) {
-        let rk: RumorKey = RumorKey::from(&member);
-        // NOTE: This sucks so much right here. Check out how we allocate no matter what, because
-        // of just how the logic goes. The value of the trace is really high, though, so we suck it
-        // for now.
-        let trace_member_id = String::from(member.get_id());
-        let trace_incarnation = member.get_incarnation();
-        let trace_health = health.clone();
-        if self.member_list.insert_health(member, health) {
-            trace_it!(MEMBERSHIP: self,
-                      TraceKind::MemberUpdate,
-                      trace_member_id,
-                      trace_incarnation,
-                      trace_health);
-            self.rumor_list.insert(rk);
-        }
-    }
-
     /// Given a membership record and some health, insert it into the Member List.
-    pub fn insert_member_from_rumor(&self, member: Member, mut health: Health) {
+    fn insert_member_from_rumor(&self, member: Member, mut health: Health) {
         let mut incremented_incarnation = false;
         let rk: RumorKey = RumorKey::from(&member);
         if member.get_id() == self.member_id() {
@@ -386,7 +419,7 @@ impl Server {
     }
 
     /// Insert members from a list of received rumors.
-    pub fn insert_member_from_rumors(&self, members: Vec<(Member, Health)>) {
+    fn insert_member_from_rumors(&self, members: Vec<(Member, Health)>) {
         for (member, health) in members.into_iter() {
             self.insert_member_from_rumor(member, health);
         }
@@ -417,12 +450,13 @@ impl Server {
     }
 
     /// Get all the Member ID's who are present in a given service group.
-    pub fn get_electorate(&self, key: &str) -> Vec<String> {
+    fn get_electorate(&self, key: &str) -> Vec<String> {
         let mut electorate = vec![];
-        self.service_store.with_rumors(key, |s| if self.member_list
-            .check_health_of_by_id(s.get_member_id(), Health::Alive) {
-            electorate.push(String::from(s.get_member_id()));
-        });
+        self.service_store
+            .with_rumors(key, |s| if self.member_list
+                   .check_health_of_by_id(s.get_member_id(), Health::Alive) {
+                electorate.push(String::from(s.get_member_id()));
+            });
         electorate
     }
 
@@ -430,7 +464,7 @@ impl Server {
     ///
     /// A given group has quorum if, from this servers perspective, it has an alive population that
     /// is over 50%, and at least 3 members.
-    pub fn check_quorum(&self, key: &str) -> bool {
+    fn check_quorum(&self, key: &str) -> bool {
         let electorate = self.get_electorate(key);
 
         let total_population = self.service_store.len_for_key(key);
@@ -447,15 +481,15 @@ impl Server {
 
     /// Start an election for the given service group, declaring this members suitability and the
     /// term for the election.
-    pub fn start_election(&self, sg: ServiceGroup, suitability: u64, term: u64) {
+    pub fn start_election(&self, sg: ServiceGroup, term: u64) {
+        let suitability = self.suitability_lookup.get(&sg);
         let mut e = Election::new(self.member_id(), sg, suitability);
         e.set_term(term);
         let ek = RumorKey::from(&e);
         if !self.check_quorum(e.key()) {
             e.no_quorum();
         }
-        self.election_store
-            .insert(e);
+        self.election_store.insert(e);
         self.rumor_list.insert(ek);
     }
 
@@ -466,8 +500,7 @@ impl Server {
         if !self.check_quorum(e.key()) {
             e.no_quorum();
         }
-        self.update_store
-            .insert(e);
+        self.update_store.insert(e);
         self.rumor_list.insert(ek);
     }
 
@@ -491,18 +524,18 @@ impl Server {
                         warn!("Restarting election with a new term as the leader has lost \
                               quorum: {:?}",
                               election);
-                        elections_to_restart.push(
-                            (String::from(&service_group[..]), election.get_term()));
+                        elections_to_restart.push((String::from(&service_group[..]),
+                                                   election.get_term()));
 
                     }
                 } else if election.is_finished() {
-                    if self.member_list
-                        .check_health_of_by_id(election.get_member_id(), Health::Confirmed) {
+                    if self.member_list.check_health_of_by_id(election.get_member_id(),
+                                                              Health::Confirmed) {
                         warn!("Restarting election with a new term as the leader is dead {}: {:?}",
                               self.member_id(),
                               election);
-                        elections_to_restart.push(
-                                (String::from(&service_group[..]), election.get_term()));
+                        elections_to_restart.push((String::from(&service_group[..]),
+                                                   election.get_term()));
                     }
                 }
             }
@@ -520,18 +553,18 @@ impl Server {
                         warn!("Restarting election with a new term as the leader has lost \
                               quorum: {:?}",
                               election);
-                        update_elections_to_restart.push(
-                            (String::from(&service_group[..]), election.get_term()));
+                        update_elections_to_restart.push((String::from(&service_group[..]),
+                                                          election.get_term()));
 
                     }
                 } else if election.is_finished() {
-                    if self.member_list
-                        .check_health_of_by_id(election.get_member_id(), Health::Confirmed) {
+                    if self.member_list.check_health_of_by_id(election.get_member_id(),
+                                                              Health::Confirmed) {
                         warn!("Restarting election with a new term as the leader is dead {}: {:?}",
                               self.member_id(),
                               election);
-                        update_elections_to_restart.push(
-                                (String::from(&service_group[..]), election.get_term()));
+                        update_elections_to_restart.push((String::from(&service_group[..]),
+                                                          election.get_term()));
                     }
                 }
             }
@@ -550,7 +583,7 @@ impl Server {
             let term = old_term + 1;
             warn!("Starting a new election for {} {}", sg, term);
             self.election_store.remove(&service_group, "election");
-            self.start_election(sg, 0, term);
+            self.start_election(sg, term);
         }
 
         for (service_group, old_term) in update_elections_to_restart {
@@ -577,13 +610,16 @@ impl Server {
         let rk = RumorKey::from(&election);
 
         // If this is an election for a service group we care about
-        if self.service_store.contains_rumor(election.get_service_group(), self.member_id()) {
+        if self.service_store
+               .contains_rumor(election.get_service_group(), self.member_id()) {
             // And the election store already has an election rumor for this election
-            if self.election_store.contains_rumor(election.key(), election.id()) {
+            if self.election_store
+                   .contains_rumor(election.key(), election.id()) {
                 let mut new_term = false;
-                self.election_store.with_rumor(election.key(), election.id(), |ce| {
-                    new_term = election.get_term() > ce.unwrap().get_term()
-                });
+                self.election_store
+                    .with_rumor(election.key(),
+                                election.id(),
+                                |ce| new_term = election.get_term() > ce.unwrap().get_term());
                 if new_term {
                     self.election_store.remove(election.key(), election.id());
                     let sg = match ServiceGroup::from_str(election.get_service_group()) {
@@ -593,7 +629,7 @@ impl Server {
                             return;
                         }
                     };
-                    self.start_election(sg, 0, election.get_term());
+                    self.start_election(sg, election.get_term());
                 }
                 // If we are the member that this election is voting for, then check to see if the
                 // election is over! If it is, mark this election as final before you process it.
@@ -629,7 +665,7 @@ impl Server {
                         return;
                     }
                 };
-                self.start_election(sg, 0, election.get_term());
+                self.start_election(sg, election.get_term());
             }
             if !election.is_finished() {
                 let has_quorum = self.check_quorum(election.key());
@@ -649,13 +685,16 @@ impl Server {
         let rk = RumorKey::from(&election);
 
         // If this is an election for a service group we care about
-        if self.service_store.contains_rumor(election.get_service_group(), self.member_id()) {
+        if self.service_store
+               .contains_rumor(election.get_service_group(), self.member_id()) {
             // And the election store already has an election rumor for this election
-            if self.update_store.contains_rumor(election.key(), election.id()) {
+            if self.update_store
+                   .contains_rumor(election.key(), election.id()) {
                 let mut new_term = false;
-                self.update_store.with_rumor(election.key(), election.id(), |ce| {
-                    new_term = election.get_term() > ce.unwrap().get_term()
-                });
+                self.update_store
+                    .with_rumor(election.key(),
+                                election.id(),
+                                |ce| new_term = election.get_term() > ce.unwrap().get_term());
                 if new_term {
                     self.update_store.remove(election.key(), election.id());
                     let sg = match ServiceGroup::from_str(election.get_service_group()) {
@@ -730,8 +769,9 @@ impl Server {
                    sf.get_incarnation() > *current_incarnation.unwrap() {
                     match sf.body() {
                         Ok(body) => {
-                            service_files.push(
-                                (sf.get_incarnation(), String::from(sf.get_filename()), body))
+                            service_files.push((sf.get_incarnation(),
+                                                String::from(sf.get_filename()),
+                                                body))
                         }
                         Err(e) => {
                             warn!("Cannot decrypt service file for {} {} {}: {}",
@@ -752,20 +792,18 @@ impl Server {
                               incarnation: Option<u64>)
                               -> Option<(u64, toml::Value)> {
         let mut result = None;
-        self.service_config_store.with_rumor(service_group,
-                                             "service_config",
-                                             |maybe_sc| if let Some(sc) = maybe_sc {
-                                                 if incarnation.is_none() ||
-                                                    sc.get_incarnation() > incarnation.unwrap() {
-                                                     match sc.config() {
-                                                         Ok(config) => {
-                                                             result = Some((sc.get_incarnation(),
-                                                                            config))
-                                                         }
-                                                         Err(err) => warn!("{}", err),
-                                                     }
-                                                 }
-                                             });
+        self.service_config_store
+            .with_rumor(service_group,
+                        "service_config",
+                        |maybe_sc| if let Some(sc) = maybe_sc {
+                            if incarnation.is_none() ||
+                               sc.get_incarnation() > incarnation.unwrap() {
+                                match sc.config() {
+                                    Ok(config) => result = Some((sc.get_incarnation(), config)),
+                                    Err(err) => warn!("{}", err),
+                                }
+                            }
+                        });
         result
     }
 
@@ -775,6 +813,29 @@ impl Server {
 
     fn unwrap_wire(&self, payload: &[u8]) -> Result<Vec<u8>> {
         message::unwrap_wire(payload, &self.ring_key)
+    }
+
+    fn persist_data(&self) {
+        if let Some(ref dat_file) = *self.dat_file.read().expect("DatFile lock poisoned") {
+            if let Some(err) = dat_file.write(self).err() {
+                println!("Error persisting rumors to disk, {}", err);
+            }
+        }
+    }
+}
+
+impl Serialize for Server {
+    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
+        where S: Serializer
+    {
+        let mut strukt = try!(serializer.serialize_struct("butterfly", 6));
+        try!(strukt.serialize_field("member", &self.member_list));
+        try!(strukt.serialize_field("service", &self.service_store));
+        try!(strukt.serialize_field("service_config", &self.service_config_store));
+        try!(strukt.serialize_field("service_file", &self.service_file_store));
+        try!(strukt.serialize_field("election", &self.election_store));
+        try!(strukt.serialize_field("election_update", &self.update_store));
+        strukt.end()
     }
 }
 
@@ -788,17 +849,42 @@ impl fmt::Display for Server {
     }
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.persist_data();
+    }
+}
+
+fn persist_loop(server: Server) {
+    loop {
+        let next_check = Instant::now() + Duration::from_millis(30_000);
+        server.persist_data();
+        let time_to_wait = next_check - Instant::now();
+        thread::sleep(time_to_wait);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod server {
-        use server::Server;
+        use habitat_core::service::ServiceGroup;
+        use server::{Server, Suitability};
         use server::timing::Timing;
         use member::Member;
         use trace::Trace;
+        use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
 
         static SWIM_PORT: AtomicUsize = ATOMIC_USIZE_INIT;
         static GOSSIP_PORT: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        #[derive(Debug)]
+        struct ZeroSuitability;
+        impl Suitability for ZeroSuitability {
+            fn get(&self, _service_group: &ServiceGroup) -> u64 {
+                0
+            }
+        }
 
         fn start_server() -> Server {
             SWIM_PORT.compare_and_swap(0, 6666, Ordering::Relaxed);
@@ -807,7 +893,7 @@ mod tests {
             let swim_listen = format!("127.0.0.1:{}", swim_port);
             let gossip_port = GOSSIP_PORT.fetch_add(1, Ordering::Relaxed);
             let gossip_listen = format!("127.0.0.1:{}", gossip_port);
-            let mut member = Member::new();
+            let mut member = Member::default();
             member.set_swim_port(swim_port as i32);
             member.set_gossip_port(gossip_port as i32);
             Server::new(&swim_listen[..],
@@ -815,8 +901,10 @@ mod tests {
                         member,
                         Trace::default(),
                         None,
-                        None)
-                .unwrap()
+                        None,
+                        None::<PathBuf>,
+                        Box::new(ZeroSuitability))
+                    .unwrap()
         }
 
         #[test]
@@ -828,20 +916,24 @@ mod tests {
         fn invalid_addresses_fails() {
             let swim_listen = "";
             let gossip_listen = "";
-            let member = Member::new();
+            let member = Member::default();
             assert!(Server::new(&swim_listen[..],
                                 &gossip_listen[..],
                                 member,
                                 Trace::default(),
                                 None,
-                                None)
-                .is_err())
+                                None,
+                                None::<PathBuf>,
+                                Box::new(ZeroSuitability))
+                            .is_err())
         }
 
         #[test]
         fn start_listener() {
-            let server = start_server();
-            server.start(Timing::default()).expect("Server failed to start");
+            let mut server = start_server();
+            server
+                .start(Timing::default())
+                .expect("Server failed to start");
         }
     }
 }

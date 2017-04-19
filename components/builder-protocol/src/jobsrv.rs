@@ -17,6 +17,7 @@ use std::str::FromStr;
 
 use protobuf::ProtobufEnum;
 use serde::{Serialize, Serializer};
+use serde::ser::SerializeStruct;
 
 use message::{Persistable, Routable};
 use sharding::InstaId;
@@ -54,17 +55,25 @@ impl Routable for JobGet {
     }
 }
 
+impl Routable for Job {
+    type H = InstaId;
+
+    fn route_key(&self) -> Option<Self::H> {
+        Some(InstaId(self.get_id()))
+    }
+}
+
 impl Serialize for Job {
-    fn serialize<S>(&self, serializer: &mut S) -> result::Result<(), S::Error>
+    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
         where S: Serializer
     {
-        let mut state = try!(serializer.serialize_struct("job", 3));
-        try!(serializer.serialize_struct_elt(&mut state, "id", self.get_id()));
-        try!(serializer.serialize_struct_elt(&mut state, "state", self.get_state()));
+        let mut strukt = try!(serializer.serialize_struct("job", 3));
+        try!(strukt.serialize_field("id", &self.get_id()));
+        try!(strukt.serialize_field("state", &self.get_state()));
         if self.has_error() {
-            try!(serializer.serialize_struct_elt(&mut state, "error", self.get_error()));
+            try!(strukt.serialize_field("error", self.get_error()));
         }
-        serializer.serialize_struct_end(state)
+        strukt.end()
     }
 }
 
@@ -75,10 +84,18 @@ impl Default for JobState {
 }
 
 impl Serialize for JobState {
-    fn serialize<S>(&self, serializer: &mut S) -> result::Result<(), S::Error>
+    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
         where S: Serializer
     {
-        serializer.serialize_i32(self.value())
+        match *self as u64 {
+            0 => serializer.serialize_str("Pending"),
+            1 => serializer.serialize_str("Processing"),
+            2 => serializer.serialize_str("Complete"),
+            3 => serializer.serialize_str("Rejected"),
+            4 => serializer.serialize_str("Failed"),
+            5 => serializer.serialize_str("Dispatched"),
+            _ => panic!("Unexpected enum value"),
+        }
     }
 }
 

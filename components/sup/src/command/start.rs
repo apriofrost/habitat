@@ -47,126 +47,48 @@
 //! See the [documentation on topologies](../topology) for a deeper discussion of how they function.
 //!
 
-use std::env;
 use std::path::Path;
 
 use ansi_term::Colour::Yellow;
-use common::command::package::install;
+use common;
 use common::ui::UI;
-use depot_client::Client;
-use hcore::fs::{am_i_root, cache_artifact_path, FS_ROOT_PATH};
-use hcore::package::PackageIdent;
+use hcore::fs::{self, FS_ROOT_PATH};
 
 use {PRODUCT, VERSION};
-use error::{Error, Result};
-use config::gconfig;
-use package::Package;
-use manager::Manager;
-use manager::{Service, UpdateStrategy};
+use error::Result;
+use manager::{Manager, ManagerConfig};
+use manager::ServiceSpec;
 
 static LOGKEY: &'static str = "CS";
 
-/// Creates a [Package](../../pkg/struct.Package.html), then passes it to the run method of the
-/// selected [topology](../../topology).
-///
-/// # Failures
-///
-/// * Fails if it cannot find a package with the given name
-/// * Fails if the `run` method for the topology fails
-/// * Fails if an unknown topology was specified on the command line
-pub fn package() -> Result<()> {
+pub fn run(cfg: ManagerConfig,
+           service_spec: Option<ServiceSpec>,
+           local_artifact: Option<&str>)
+           -> Result<()> {
     let mut ui = UI::default();
-    if !am_i_root() {
-        try!(ui.warn("Running the Habitat Supervisor requires root or administrator privileges. \
-                      Please retry this command as a super user or use a privilege-granting \
-                      facility such as sudo."));
-        try!(ui.br());
-        return Err(sup_error!(Error::RootRequired));
+    if !fs::am_i_root() {
+        ui.warn("Running the Habitat Supervisor with root or superuser privileges is recommended")?;
+        ui.br()?;
     }
-
-    match Package::load(gconfig().package(), Some(&*FS_ROOT_PATH)) {
-        Ok(mut package) => {
-            let update_strategy = gconfig().update_strategy();
-            match update_strategy {
-                UpdateStrategy::None => {}
-                _ => {
-                    let url = gconfig().url();
-                    outputln!("Checking Depot for newer versions...");
-                    // It is important to pass `gconfig().package()` to `show_package()` instead
-                    // of the package identifier of the loaded package. This will ensure that
-                    // if the operator starts a package while specifying a version number, they
-                    // will only automatically receive release updates for the started package.
-                    //
-                    // If the operator does not specify a version number they will
-                    // automatically receive updates for any releases, regardless of version
-                    // number, for the started  package.
-                    let depot_client = try!(Client::new(url, PRODUCT, VERSION, None));
-                    let latest_pkg_data = try!(depot_client.show_package(gconfig().package()));
-                    let latest_ident: PackageIdent = latest_pkg_data.get_ident().clone().into();
-                    if &latest_ident > package.ident() {
-                        outputln!("Downloading latest version from Depot: {}", latest_ident);
-                        let new_pkg_data = try!(install::start(&mut ui,
-                                                               url,
-                                                               &latest_ident.to_string(),
-                                                               PRODUCT,
-                                                               VERSION,
-                                                               Path::new(&*FS_ROOT_PATH),
-                                                               &cache_artifact_path(None),
-                                                               false));
-                        package = try!(Package::load(&new_pkg_data, Some(&*FS_ROOT_PATH)));
-                    } else {
-                        outputln!("Already running latest.");
-                    };
-                }
-            }
-            start_package(package)
+    if let Some(spec) = service_spec {
+        if let Some(artifact) = local_artifact {
+            outputln!("Installing local artifact {}",
+                      Yellow.bold().paint(artifact));
+            common::command::package::install::start(&mut ui,
+                                                     &spec.depot_url,
+                                                     artifact,
+                                                     PRODUCT,
+                                                     VERSION,
+                                                     Path::new(&*FS_ROOT_PATH),
+                                                     &fs::cache_artifact_path(None),
+                                                     false)?;
         }
-        Err(_) => {
-            outputln!("{} is not installed",
-                      Yellow.bold().paint(gconfig().package().to_string()));
-            let url = gconfig().url();
-            let new_pkg_data = match gconfig().local_artifact() {
-                Some(artifact) => {
-                    try!(install::start(&mut ui,
-                                        url,
-                                        &artifact,
-                                        PRODUCT,
-                                        VERSION,
-                                        Path::new(&*FS_ROOT_PATH),
-                                        &cache_artifact_path(None),
-                                        false))
-                }
-                None => {
-                    outputln!("Searching for {} in remote {}",
-                              Yellow.bold().paint(gconfig().package().to_string()),
-                              url);
-                    try!(install::start(&mut ui,
-                                        url,
-                                        &gconfig().package().to_string(),
-                                        PRODUCT,
-                                        VERSION,
-                                        Path::new(&*FS_ROOT_PATH),
-                                        &cache_artifact_path(None),
-                                        false))
-                }
-            };
-            let package = try!(Package::load(&new_pkg_data, Some(&*FS_ROOT_PATH)));
-            start_package(package)
-        }
+        Manager::save_spec_for(&cfg, spec)?;
     }
-}
-
-fn start_package(package: Package) -> Result<()> {
-    let run_path = try!(package.run_path());
-    debug!("Setting the PATH to {}", run_path);
-    env::set_var("PATH", &run_path);
-
-    let mut manager = try!(Manager::new());
-    let service = try!(Service::new(package,
-                                    gconfig().group(),
-                                    gconfig().organization().clone(),
-                                    gconfig().topology(),
-                                    gconfig().update_strategy()));
-    try!(manager.add_service(service));
-    manager.run()
+    if !Manager::is_running(&cfg)? {
+        let mut manager = Manager::load(cfg)?;
+        manager.run()
+    } else {
+        Ok(())
+    }
 }

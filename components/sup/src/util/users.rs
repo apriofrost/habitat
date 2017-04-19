@@ -16,10 +16,10 @@ use error::{Result, Error};
 use hcore::os::users;
 use hcore::package::PackageInstall;
 
-static LOGKEY: &'static str = "UR";
+pub const DEFAULT_USER: &'static str = "hab";
+pub const DEFAULT_GROUP: &'static str = "hab";
 
-const DEFAULT_USER: &'static str = "hab";
-const DEFAULT_GROUP: &'static str = "hab";
+static LOGKEY: &'static str = "UR";
 
 /// This function checks to see if a custom SVC_USER and SVC_GROUP has
 /// been specified as part of the package metadata.
@@ -49,12 +49,12 @@ fn check_pkg_user_and_group(pkg_install: &PackageInstall) -> Result<Option<(Stri
 
             if let None = current_user {
                 return Err(sup_error!(Error::Permissions("Can't determine current user"
-                    .to_string())));
+                                                             .to_string())));
             }
 
             if let None = current_group {
                 return Err(sup_error!(Error::Permissions("Can't determine current group"
-                    .to_string())));
+                                                             .to_string())));
             }
 
             let current_user = current_user.unwrap();
@@ -97,7 +97,7 @@ fn get_default_user_and_group() -> Result<(String, String)> {
                 }
                 _ => {
                     return Err(sup_error!(Error::Permissions("Can't determine current user:group"
-                        .to_string())))
+                                                                 .to_string())))
                 }
             }
         }

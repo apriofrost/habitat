@@ -29,13 +29,13 @@ use message::swim::{Rumor, Rumor_Type};
 use trace::TraceKind;
 
 /// Takes a reference to the server itself
-pub struct Pull<'a> {
-    pub server: &'a Server,
+pub struct Pull {
+    pub server: Server,
 }
 
-impl<'a> Pull<'a> {
+impl Pull {
     /// Create a new Pull
-    pub fn new(server: &'a Server) -> Pull {
+    pub fn new(server: Server) -> Pull {
         Pull { server: server }
     }
 
@@ -46,10 +46,14 @@ impl<'a> Pull<'a> {
             .as_mut()
             .socket(zmq::PULL)
             .expect("Failure to create the ZMQ pull socket");
-        socket.set_linger(0).expect("Failure to set the ZMQ Pull socket to not linger");
-        socket.set_tcp_keepalive(0)
+        socket
+            .set_linger(0)
+            .expect("Failure to set the ZMQ Pull socket to not linger");
+        socket
+            .set_tcp_keepalive(0)
             .expect("Failure to set the ZMQ Pull socket to not use keepalive");
-        socket.bind(&format!("tcp://{}", self.server.gossip_addr()))
+        socket
+            .bind(&format!("tcp://{}", self.server.gossip_addr()))
             .expect("Failure to bind the ZMQ Pull socket to the port");
         'recv: loop {
             if self.server.pause.load(Ordering::Relaxed) {

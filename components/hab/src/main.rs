@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[macro_use]
 extern crate clap;
 extern crate env_logger;
 extern crate hab;
@@ -20,12 +19,15 @@ extern crate habitat_core as hcore;
 extern crate habitat_common as common;
 extern crate handlebars;
 #[macro_use]
+extern crate lazy_static;
+#[macro_use]
 extern crate log;
 
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Read};
-use std::path::Path;
+use std::io::prelude::*;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::thread;
 
@@ -35,8 +37,7 @@ use common::ui::{Coloring, UI, NOCOLORING_ENVVAR, NONINTERACTIVE_ENVVAR};
 use hcore::env as henv;
 use hcore::crypto::{init, default_cache_key_path, SigKeyPair};
 use hcore::crypto::keys::PairType;
-use hcore::fs::{cache_artifact_path, cache_analytics_path, cache_key_path, FS_ROOT_PATH,
-                FS_ROOT_ENVVAR};
+use hcore::fs::{cache_artifact_path, cache_analytics_path, cache_key_path};
 use hcore::service::ServiceGroup;
 use hcore::package::PackageIdent;
 use hcore::url::{DEFAULT_DEPOT_URL, DEPOT_URL_ENVVAR};
@@ -46,8 +47,21 @@ use hab::error::{Error, Result};
 
 /// Makes the --org CLI param optional when this env var is set
 const HABITAT_ORG_ENVVAR: &'static str = "HAB_ORG";
-
 const DEFAULT_BINLINK_DIR: &'static str = "/bin";
+
+lazy_static! {
+    /// The default filesystem root path to base all commands from. This is lazily generated on
+    /// first call and reflects on the presence and value of the environment variable keyed as
+    /// `FS_ROOT_ENVVAR`.
+    static ref FS_ROOT: PathBuf = {
+        use hcore::fs::FS_ROOT_ENVVAR;
+        if let Some(root) = henv::var(FS_ROOT_ENVVAR).ok() {
+            PathBuf::from(root)
+        } else {
+            PathBuf::from("/")
+        }
+    };
+}
 
 fn main() {
     env_logger::init().unwrap();
@@ -65,11 +79,12 @@ fn start(ui: &mut UI) -> Result<()> {
     let (args, remaining_args) = raw_parse_args();
     debug!("clap cli args: {:?}", &args);
     debug!("remaining cli args: {:?}", &remaining_args);
-    let app_matches =
-        cli::get().get_matches_from_safe_borrow(&mut args.iter()).unwrap_or_else(|e| {
-            analytics::instrument_clap_error(&e);
-            e.exit();
-        });
+    let app_matches = cli::get()
+        .get_matches_from_safe_borrow(&mut args.iter())
+        .unwrap_or_else(|e| {
+                            analytics::instrument_clap_error(&e);
+                            e.exit();
+                        });
     match app_matches.subcommand() {
         ("cli", Some(matches)) => {
             match matches.subcommand() {
@@ -99,6 +114,7 @@ fn start(ui: &mut UI) -> Result<()> {
                 ("binlink", Some(m)) => try!(sub_pkg_binlink(ui, m)),
                 ("build", Some(m)) => try!(sub_pkg_build(ui, m)),
                 ("config", Some(m)) => try!(sub_pkg_config(m)),
+                ("env", Some(m)) => try!(sub_pkg_env(m)),
                 ("exec", Some(m)) => try!(sub_pkg_exec(m, remaining_args)),
                 ("export", Some(m)) => try!(sub_pkg_export(ui, m)),
                 ("hash", Some(m)) => try!(sub_pkg_hash(m)),
@@ -161,24 +177,21 @@ fn start(ui: &mut UI) -> Result<()> {
 }
 
 fn sub_cli_setup(ui: &mut UI) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     init();
 
     command::cli::setup::start(ui,
-                               &default_cache_key_path(fs_root_path),
-                               &cache_analytics_path(fs_root_path))
+                               &default_cache_key_path(Some(&*FS_ROOT)),
+                               &cache_analytics_path(Some(&*FS_ROOT)))
 }
 
 fn sub_cli_completers(m: &ArgMatches) -> Result<()> {
-    let shell = m.value_of("SHELL").expect("Missing Shell; A shell is required");
+    let shell = m.value_of("SHELL")
+        .expect("Missing Shell; A shell is required");
     cli::get().gen_completions_to("hab", shell.parse::<Shell>().unwrap(), &mut io::stdout());
     Ok(())
 }
 
 fn sub_origin_key_download(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let origin = m.value_of("ORIGIN").unwrap(); // Required via clap
     let revision = m.value_of("REVISION");
     let env_or_default = henv::var(DEPOT_URL_ENVVAR).unwrap_or(DEFAULT_DEPOT_URL.to_string());
@@ -188,43 +201,33 @@ fn sub_origin_key_download(ui: &mut UI, m: &ArgMatches) -> Result<()> {
                                           &url,
                                           &origin,
                                           revision,
-                                          &default_cache_key_path(fs_root_path))
+                                          &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_origin_key_export(m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let origin = m.value_of("ORIGIN").unwrap(); // Required via clap
-    let pair_type = try!(PairType::from_str(m.value_of("PAIR_TYPE").unwrap()));
+    let pair_type = try!(PairType::from_str(m.value_of("PAIR_TYPE").unwrap_or("public")));
     init();
 
-    command::origin::key::export::start(origin, pair_type, &default_cache_key_path(fs_root_path))
+    command::origin::key::export::start(origin, pair_type, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_origin_key_generate(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let origin = try!(origin_param_or_env(&m));
     init();
 
-    command::origin::key::generate::start(ui, &origin, &default_cache_key_path(fs_root_path))
+    command::origin::key::generate::start(ui, &origin, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_origin_key_import(ui: &mut UI) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let mut content = String::new();
     try!(io::stdin().read_to_string(&mut content));
     init();
 
-    command::origin::key::import::start(ui, &content, &default_cache_key_path(fs_root_path))
+    command::origin::key::import::start(ui, &content, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_origin_key_upload(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
-
     let env_or_default = henv::var(DEPOT_URL_ENVVAR).unwrap_or(DEFAULT_DEPOT_URL.to_string());
     let url = m.value_of("DEPOT_URL").unwrap_or(&env_or_default);
     let token = try!(auth_token_param_or_env(&m));
@@ -240,7 +243,7 @@ fn sub_origin_key_upload(ui: &mut UI, m: &ArgMatches) -> Result<()> {
                                                    &token,
                                                    origin,
                                                    with_secret,
-                                                   &default_cache_key_path(fs_root_path))
+                                                   &default_cache_key_path(Some(&*FS_ROOT)))
     } else {
         let keyfile = Path::new(m.value_of("PUBLIC_FILE").unwrap());
         let secret_keyfile = m.value_of("SECRET_FILE").map(|f| Path::new(f));
@@ -249,19 +252,15 @@ fn sub_origin_key_upload(ui: &mut UI, m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_pkg_binlink(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Path::new(&fs_root);
     let ident = try!(PackageIdent::from_str(m.value_of("PKG_IDENT").unwrap()));
-    let binary = m.value_of("BINARY").unwrap(); // Required via clap
     let dest_dir = Path::new(m.value_of("DEST_DIR").unwrap_or(DEFAULT_BINLINK_DIR));
-
-    command::pkg::binlink::start(ui, &ident, &binary, &dest_dir, &fs_root_path)
+    match m.value_of("BINARY") {
+        Some(binary) => command::pkg::binlink::start(ui, &ident, &binary, &dest_dir, &*FS_ROOT),
+        None => command::pkg::binlink::binlink_all_in_pkg(ui, &ident, dest_dir, &*FS_ROOT),
+    }
 }
 
 fn sub_pkg_build(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
-
     let plan_context = m.value_of("PLAN_CONTEXT").unwrap(); // Required via clap
     let root = m.value_of("HAB_STUDIO_ROOT");
     let src = m.value_of("SRC_PATH");
@@ -271,7 +270,7 @@ fn sub_pkg_build(ui: &mut UI, m: &ArgMatches) -> Result<()> {
             for key in keys.clone() {
                 // Validate that all secret keys are present
                 let pair = try!(SigKeyPair::get_latest_pair_for(key,
-                                &default_cache_key_path(fs_root_path)));
+                                &default_cache_key_path(Some(&*FS_ROOT))));
                 let _ = pair.secret();
             }
             Some(keys.collect::<Vec<_>>().join(","))
@@ -288,11 +287,16 @@ fn sub_pkg_build(ui: &mut UI, m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_pkg_config(m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Path::new(&fs_root);
     let ident = try!(PackageIdent::from_str(m.value_of("PKG_IDENT").unwrap()));
 
-    command::pkg::config::start(&ident, &fs_root_path)
+    try!(common::command::package::config::start(&ident, &*FS_ROOT));
+    Ok(())
+}
+
+fn sub_pkg_env(m: &ArgMatches) -> Result<()> {
+    let ident = PackageIdent::from_str(m.value_of("PKG_IDENT").unwrap())?;
+
+    command::pkg::env::start(&ident, &*FS_ROOT)
 }
 
 fn sub_pkg_exec(m: &ArgMatches, cmd_args: Vec<OsString>) -> Result<()> {
@@ -310,10 +314,22 @@ fn sub_pkg_export(ui: &mut UI, m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_pkg_hash(m: &ArgMatches) -> Result<()> {
-    let source = m.value_of("SOURCE").unwrap(); // Required via clap
-
     init();
-    command::pkg::hash::start(&source)
+    match m.value_of("SOURCE") {
+        Some(source) => {
+            // hash single file
+            command::pkg::hash::start(&source)
+        }
+        None => {
+            // read files from stdin
+            let stdin = io::stdin();
+            for line in stdin.lock().lines() {
+                let file = try!(line);
+                try!(command::pkg::hash::start(file.trim_right()));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn sub_plan_init(ui: &mut UI, m: &ArgMatches) -> Result<()> {
@@ -324,8 +340,6 @@ fn sub_plan_init(ui: &mut UI, m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_pkg_install(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let env_or_default = henv::var(DEPOT_URL_ENVVAR).unwrap_or(DEFAULT_DEPOT_URL.to_string());
     let url = m.value_of("DEPOT_URL").unwrap_or(&env_or_default);
     let ident_or_artifacts = m.values_of("PKG_IDENT_OR_ARTIFACT").unwrap(); // Required via clap
@@ -342,37 +356,30 @@ fn sub_pkg_install(ui: &mut UI, m: &ArgMatches) -> Result<()> {
                                                       ident_or_artifact,
                                                       PRODUCT,
                                                       VERSION,
-                                                      Path::new(&fs_root),
-                                                      &cache_artifact_path(fs_root_path),
+                                                      &*FS_ROOT,
+                                                      &cache_artifact_path(Some(&*FS_ROOT)),
                                                       ignore_target));
         if m.is_present("BINLINK") {
             let dest_dir = Path::new(m.value_of("DEST_DIR").unwrap_or(DEFAULT_BINLINK_DIR));
-            command::pkg::binlink::binlink_all_in_pkg(ui,
-                                                      &pkg_ident,
-                                                      dest_dir,
-                                                      &Path::new(&fs_root))?;
+            command::pkg::binlink::binlink_all_in_pkg(ui, &pkg_ident, dest_dir, &*FS_ROOT)?;
         }
     }
     Ok(())
 }
 
 fn sub_pkg_path(m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Path::new(&fs_root);
     let ident = try!(PackageIdent::from_str(m.value_of("PKG_IDENT").unwrap()));
 
-    command::pkg::path::start(&ident, &fs_root_path)
+    command::pkg::path::start(&ident, &*FS_ROOT)
 }
 
 fn sub_pkg_provides(m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Path::new(&fs_root);
     let filename = m.value_of("FILE").unwrap(); // Required via clap
 
     let full_releases = m.is_present("FULL_RELEASES");
     let full_paths = m.is_present("FULL_PATHS");
 
-    command::pkg::provides::start(&filename, &fs_root_path, full_releases, full_paths)
+    command::pkg::provides::start(&filename, &*FS_ROOT, full_releases, full_paths)
 }
 
 fn sub_pkg_search(m: &ArgMatches) -> Result<()> {
@@ -383,24 +390,22 @@ fn sub_pkg_search(m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_pkg_sign(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let src = Path::new(m.value_of("SOURCE").unwrap()); // Required via clap
     let dst = Path::new(m.value_of("DEST").unwrap()); // Required via clap
     init();
     let pair = try!(SigKeyPair::get_latest_pair_for(&try!(origin_param_or_env(&m)),
-                                                    &default_cache_key_path(fs_root_path)));
+                                                    &default_cache_key_path(Some(&*FS_ROOT))));
 
     command::pkg::sign::start(ui, &pair, &src, &dst)
 }
 
 fn sub_pkg_upload(ui: &mut UI, m: &ArgMatches) -> Result<()> {
     let env_or_default = henv::var(DEPOT_URL_ENVVAR).unwrap_or(DEFAULT_DEPOT_URL.to_string());
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
-    let key_path = cache_key_path(fs_root_path);
+    let key_path = cache_key_path(Some(&*FS_ROOT));
     // don't use a pathbuf, as the P generic param for upload::start below is bound to a &str
-    let key_path = try!(key_path.to_str().ok_or(Error::CryptoCLI("Invalid key path".to_string())));
+    let key_path = try!(key_path
+                            .to_str()
+                            .ok_or(Error::CryptoCLI("Invalid key path".to_string())));
     let url = m.value_of("DEPOT_URL").unwrap_or(&env_or_default);
     let token = try!(auth_token_param_or_env(&m));
     let artifact_paths = m.values_of("HART_FILE").unwrap(); // Required via clap
@@ -411,12 +416,10 @@ fn sub_pkg_upload(ui: &mut UI, m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_pkg_verify(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let src = Path::new(m.value_of("SOURCE").unwrap()); // Required via clap
     init();
 
-    command::pkg::verify::start(ui, &src, &default_cache_key_path(fs_root_path))
+    command::pkg::verify::start(ui, &src, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_pkg_header(ui: &mut UI, m: &ArgMatches) -> Result<()> {
@@ -427,36 +430,28 @@ fn sub_pkg_header(ui: &mut UI, m: &ArgMatches) -> Result<()> {
 }
 
 fn sub_ring_key_export(m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let ring = m.value_of("RING").unwrap(); // Required via clap
     init();
 
-    command::ring::key::export::start(ring, &default_cache_key_path(fs_root_path))
+    command::ring::key::export::start(ring, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_ring_key_generate(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let ring = m.value_of("RING").unwrap(); // Required via clap
     init();
 
-    command::ring::key::generate::start(ui, ring, &default_cache_key_path(fs_root_path))
+    command::ring::key::generate::start(ui, ring, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_ring_key_import(ui: &mut UI) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let mut content = String::new();
     try!(io::stdin().read_to_string(&mut content));
     init();
 
-    command::ring::key::import::start(ui, &content, &default_cache_key_path(fs_root_path))
+    command::ring::key::import::start(ui, &content, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_service_key_generate(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let org = try!(org_param_or_env(&m));
     let service_group = try!(ServiceGroup::from_str(m.value_of("SERVICE_GROUP").unwrap()));
     init();
@@ -464,25 +459,27 @@ fn sub_service_key_generate(ui: &mut UI, m: &ArgMatches) -> Result<()> {
     command::service::key::generate::start(ui,
                                            &org,
                                            &service_group,
-                                           &default_cache_key_path(fs_root_path))
+                                           &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn sub_user_key_generate(ui: &mut UI, m: &ArgMatches) -> Result<()> {
-    let fs_root = henv::var(FS_ROOT_ENVVAR).unwrap_or(FS_ROOT_PATH.to_string());
-    let fs_root_path = Some(Path::new(&fs_root));
     let user = m.value_of("USER").unwrap(); // Required via clap
     init();
 
-    command::user::key::generate::start(ui, user, &default_cache_key_path(fs_root_path))
+    command::user::key::generate::start(ui, user, &default_cache_key_path(Some(&*FS_ROOT)))
 }
 
 fn ui() -> UI {
-    let isatty = if henv::var(NONINTERACTIVE_ENVVAR).map(|val| val == "true").unwrap_or(false) {
+    let isatty = if henv::var(NONINTERACTIVE_ENVVAR)
+           .map(|val| val == "true")
+           .unwrap_or(false) {
         Some(false)
     } else {
         None
     };
-    let coloring = if henv::var(NOCOLORING_ENVVAR).map(|val| val == "true").unwrap_or(false) {
+    let coloring = if henv::var(NOCOLORING_ENVVAR)
+           .map(|val| val == "true")
+           .unwrap_or(false) {
         Coloring::Never
     } else {
         Coloring::Auto
@@ -507,6 +504,10 @@ fn exec_subcommand_if_called(ui: &mut UI) -> Result<()> {
         }
         ("sup", _) => command::sup::start(ui, env::args_os().skip(2).collect()),
         ("start", _) => command::sup::start(ui, env::args_os().skip(1).collect()),
+        ("service", "load") |
+        ("service", "unload") |
+        ("service", "start") |
+        ("service", "stop") => command::sup::start(ui, env::args_os().skip(2).collect()),
         _ => Ok(()),
     }
 }

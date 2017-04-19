@@ -40,8 +40,9 @@ pushd "c:/projects/habitat"
 Write-Host "Configuring build environment"
 ./build.ps1 -Configure -SkipBuild
 
-
-if (Test-SourceChanged -or (test-path env:HAB_FORCE_TEST)) {
+write-host "TAG: $env:APPVEYOR_REPO_TAG_NAME"
+Write-Host "VERSION: $(Get-Content VERSION)"
+if (($env:APPVEYOR_REPO_TAG_NAME -eq "$(Get-Content VERSION)") -or (Test-SourceChanged) -or (test-path env:HAB_FORCE_TEST)) {
     foreach ($BuildAction in ($env:hab_build_action -split ';')) {
         if ($BuildAction -like 'build') {
             
@@ -64,28 +65,75 @@ if (Test-SourceChanged -or (test-path env:HAB_FORCE_TEST)) {
                 popd
             }
         }
+        elseif ($BuildAction -like 'package') {
+            Write-Host "Download and install latest release of hab.exe"
+            $bootstrapDir = "c:\habitat"
+            $url = "https://api.bintray.com/content/habitat/stable/windows/x86_64/hab-%24latest-x86_64-windows.zip?bt_package=hab-x86_64-windows"
+            mkdir $bootstrapDir -Force
+            # download a hab binary to build hab from source in a studio
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile hab.zip
+            Expand-Archive -Path hab.zip -DestinationPath $bootstrapDir
+            $habExe = (Get-Item "$bootstrapDir/*/hab.exe").FullName
+            
+            # This will override plan's CARGO_TARGET_DIR so we do not have to build each clean
+            $env:HAB_CARGO_TARGET_DIR = "c:\projects\habitat\target"
+
+            $env:HAB_ORIGIN="core"
+            if($env:ORIGIN_KEY) {
+                "SIG-SEC-1`ncore-20170318210306`n`n$($env:ORIGIN_KEY)" | & $habExe origin key import
+            }
+            else {
+                Write-Host "Generating fake secret origin key for core..."
+                & $habExe origin key generate core
+            }
+            if ($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+
+            mkdir results -Force
+            foreach ($component in ($env:hab_components -split ';')) {
+                Write-Host "Building plan for $component"
+                Write-Host ""
+                & $habExe pkg build components/$component
+                if ($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+                
+                $hart = Get-Item "C:\hab\studios\projects--habitat\src\components\$component\results\*.hart"
+                Write-Host "Copying $hart to artifacts directory..."
+                Copy-Item $hart.FullName results
+                & $habExe pkg install $hart.FullName
+                if ($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+
+                if($env:HAB_AUTH_TOKEN) {
+                    & $habExe pkg upload $hart
+                    if ($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+                }
+
+                # Install and extract hab cli bin files for zip
+                if ($component -eq "hab") {
+                    Write-Host "Packaging HAB cli zip file"
+                    Write-Host ""
+                    $zip = "hab-$env:APPVEYOR_BUILD_VERSION-x86_64-windows.zip"
+                    $zipDir = $zip.Replace(".zip", "")
+                    $stagingZipDir = "c:/projects/habitat/windows/x86_64"
+                    mkdir $zipDir -Force
+                    Copy-Item "/hab/pkgs/core/hab/*/*/bin/*" $zipDir
+
+                    mkdir $stagingZipDir -Force
+                    Compress-Archive -Path $zipDir -DestinationPath "$stagingZipDir/$zip" 
+                    if($env:APPVEYOR_REPO_TAG_NAME -eq "$(Get-Content VERSION)" -and (!$env:APPVEYOR_REPO_TAG_NAME.EndsWith("dev"))) {
+                        mkdir "results/prod" -Force
+                        Compress-Archive -Path ./windows -DestinationPath "results/prod/$zip"
+                    }
+                    Compress-Archive -Path ./windows -DestinationPath "results/$zip"
+                }
+                if ($component -eq "studio") {
+                    # Now that we have built the studio we can use current hab and studio bits
+                    Copy-Item "/hab/pkgs/core/hab/*/*/bin/*" $bootstrapDir -Force
+                }
+            }
+        }
         else {
             Write-Warning "Unsupported Build Action: $BuildAction."
         }  
     }
-
-    ## Prep artifact for publishing.
-    $HabArchiveParams = @{
-        Path = "./target/release/hab.exe", 
-                "C:\ProgramData\chocolatey\lib\habitat_native_dependencies\builds\bin\archive.dll", 
-                "C:\ProgramData\chocolatey\lib\habitat_native_dependencies\builds\bin\libeay32.dll",
-                "C:\ProgramData\chocolatey\lib\habitat_native_dependencies\builds\bin\ssleay32.dll",
-                "C:\ProgramData\chocolatey\lib\habitat_native_dependencies\builds\bin\zlib.dll",
-                "C:\ProgramData\chocolatey\lib\habitat_native_dependencies\builds\bin\libzmq.dll",
-                "C:/Windows/System32/vcruntime140.dll"
-        DestinationPath = "c:/projects/habitat/windows/x86_64/hab-$env:APPVEYOR_BUILD_VERSION-x86_64-windows.zip"
-    }
-    mkdir "c:/projects/habitat/windows/x86_64" -Force
-    Compress-Archive  @HabArchiveParams
-    Compress-Archive ./windows -DestinationPath "./hab-$env:APPVEYOR_BUILD_VERSION-x86_64-windows.zip"
-
-    Write-Host "Created artifact: "
-    ls $HabArchiveParams.DestinationPath
 }
 else {
     Write-Host "Nothing changed in Windows ported crates."

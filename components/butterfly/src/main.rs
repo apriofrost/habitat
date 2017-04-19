@@ -13,16 +13,27 @@
 // limitations under the License.
 
 extern crate env_logger;
-#[macro_use]
 extern crate log;
 extern crate habitat_butterfly;
+extern crate habitat_core;
 
 use std::env;
 use std::thread;
 use std::time::Duration;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use habitat_butterfly::{server, member, trace};
+use habitat_butterfly::server::Suitability;
+use habitat_core::service::ServiceGroup;
+
+#[derive(Debug)]
+struct ZeroSuitability;
+impl Suitability for ZeroSuitability {
+    fn get(&self, _service_group: &ServiceGroup) -> u64 {
+        0
+    }
+}
 
 fn main() {
     env_logger::init().unwrap();
@@ -38,30 +49,34 @@ fn main() {
     let gport = bind_port + 1;
     gossip_bind_addr.set_port(gport);
 
-    let mut member = member::Member::new();
+    let mut member = member::Member::default();
     member.set_swim_port(bind_port as i32);
     member.set_gossip_port(gport as i32);
 
-    let server = server::Server::new(bind_to_addr,
-                                     gossip_bind_addr,
-                                     member,
-                                     trace::Trace::default(),
-                                     None,
-                                     None)
-        .unwrap();
-    println!("Server ID: {}", server.member_id);
+    let mut server = server::Server::new(bind_to_addr,
+                                         gossip_bind_addr,
+                                         member,
+                                         trace::Trace::default(),
+                                         None,
+                                         None,
+                                         None::<PathBuf>,
+                                         Box::new(ZeroSuitability))
+            .unwrap();
+    println!("Server ID: {}", server.member_id());
 
     let targets: Vec<String> = args.collect();
     for target in &targets {
         let addr: SocketAddr = target.parse().unwrap();
-        let mut member = member::Member::new();
+        let mut member = member::Member::default();
         member.set_address(format!("{}", addr.ip()));
         member.set_swim_port(addr.port() as i32);
         member.set_gossip_port(addr.port() as i32);
         server.member_list.add_initial_member(member);
     }
 
-    server.start(server::timing::Timing::default()).expect("Cannot start server");
+    server
+        .start(server::timing::Timing::default())
+        .expect("Cannot start server");
     loop {
         println!("{:#?}", server.member_list);
         thread::sleep(Duration::from_millis(1000));

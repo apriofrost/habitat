@@ -14,7 +14,7 @@ by having a convention cover it. When we do need to configure things, we set rea
 
 ## Workstation Setup
 
-See [docs/BUILDING.md](docs/BUILDING.md) for platform specific info on getting your workstation configured to contribute.
+See [BUILDING.md](BUILDING.md) for platform specific info on getting your workstation configured to contribute.
 
 ## Writing new features
 
@@ -110,11 +110,17 @@ Note: **do not** click the Merge Pull Request button if it's enabled.
 
 ## Running a Builder service cluster locally
 
-A service cluster can be started in your host machine with `make bldr-run` or within a docker
-container with `make bldr-run-shell`. The public API will be available on port 9636 and the admin
-API will be available on port 8080.
+A service cluster can be started in your host machine with `make bldr-run`. The public API will be available on port 9636 and the admin API will be available on port 8080. The depot web site will be available on port 3000.
+
+You will need a Github bearer token to authenticate to the service. Here is an example of creating an origin in a local builder service:
+
+```
+curl -H "authorization:Bearer 7798a535d5dba1b9fbf9694cb51a1f4ccf3f28d8" -X POST -d '{"name": "mwrock"}' http://localhost:9636/v1/depot/origins
+```
 
 > Note: some manual setup is required to run a Builder cluster on your host machine. This process will be automated in the future, but for now your mileage may vary.
+
+Also be aware that if you need to run the web services from anywhere other than localhost or port 3000, see the `builder-web` [readme](https://github.com/habitat-sh/habitat/blob/master/components/builder-web/README.md) for how to configure oath with an alternate endpoint.
 
 ### Documentation for Rust Crates
 

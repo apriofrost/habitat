@@ -14,6 +14,8 @@
 
 //! A collection of handlers for the HTTP server's router
 
+use std::env;
+
 use base64;
 use bodyparser;
 use depot::server::check_origin_access;
@@ -21,15 +23,17 @@ use hab_core::package::Plan;
 use hab_core::event::*;
 use hab_net;
 use hab_net::http::controller::*;
-use hab_net::routing::Broker;
+use hab_net::routing::{Broker, BrokerConn};
 use iron::prelude::*;
 use iron::status;
 use iron::typemap;
 use persistent;
 use protocol::jobsrv::{Job, JobGet, JobSpec};
-use protocol::vault::*;
+use protocol::originsrv::*;
+use protocol::sessionsrv;
 use protocol::net::{self, NetOk, ErrCode};
 use router::Router;
+use serde_json;
 
 define_event_log!();
 
@@ -64,6 +68,19 @@ pub fn github_authenticate(req: &mut Request) -> IronResult<Response> {
     };
 
     let github = req.get::<persistent::Read<GitHubCli>>().unwrap();
+
+    if env::var_os("HAB_FUNC_TEST").is_some() {
+        let session = try!(session_create(&github, &code));
+
+        log_event!(req,
+                   Event::GithubAuthenticate {
+                       user: session.get_name().to_string(),
+                       account: session.get_id().to_string(),
+                   });
+
+        return Ok(render_json(status::Ok, &session));
+    }
+
     match github.authenticate(&code) {
         Ok(token) => {
             let session = try!(session_create(&github, &token));
@@ -86,17 +103,17 @@ pub fn github_authenticate(req: &mut Request) -> IronResult<Response> {
 }
 
 pub fn job_create(req: &mut Request) -> IronResult<Response> {
-    let mut project_get = ProjectGet::new();
+    let mut project_get = OriginProjectGet::new();
     {
         match req.get::<bodyparser::Struct<JobCreateReq>>() {
-            Ok(Some(body)) => project_get.set_id(body.project_id),
+            Ok(Some(body)) => project_get.set_name(body.project_id),
             _ => return Ok(Response::with(status::UnprocessableEntity)),
         }
     }
     // TODO: SA - Eliminate need to clone the session
     let session = req.extensions.get::<Authenticated>().unwrap().clone();
     let mut conn = Broker::connect().unwrap();
-    let project = match conn.route::<ProjectGet, Project>(&project_get) {
+    let project = match conn.route::<OriginProjectGet, OriginProject>(&project_get) {
         Ok(project) => project,
         Err(err) => return Ok(render_net_error(&err)),
     };
@@ -143,9 +160,9 @@ pub fn status(_req: &mut Request) -> IronResult<Response> {
 pub fn list_account_invitations(req: &mut Request) -> IronResult<Response> {
     let session = req.extensions.get::<Authenticated>().unwrap();
     let mut conn = Broker::connect().unwrap();
-    let mut request = AccountInvitationListRequest::new();
+    let mut request = sessionsrv::AccountInvitationListRequest::new();
     request.set_account_id(session.get_id());
-    match conn.route::<AccountInvitationListRequest, AccountInvitationListResponse>(&request) {
+    match conn.route::<sessionsrv::AccountInvitationListRequest, sessionsrv::AccountInvitationListResponse>(&request) {
         Ok(invites) => Ok(render_json(status::Ok, &invites)),
         Err(err) => Ok(render_net_error(&err)),
     }
@@ -154,72 +171,18 @@ pub fn list_account_invitations(req: &mut Request) -> IronResult<Response> {
 pub fn list_user_origins(req: &mut Request) -> IronResult<Response> {
     let session = req.extensions.get::<Authenticated>().unwrap();
     let mut conn = Broker::connect().unwrap();
-    let mut request = AccountOriginListRequest::new();
+    let mut request = sessionsrv::AccountOriginListRequest::new();
     request.set_account_id(session.get_id());
-    match conn.route::<AccountOriginListRequest, AccountOriginListResponse>(&request) {
+    match conn.route::<sessionsrv::AccountOriginListRequest, sessionsrv::AccountOriginListResponse>(&request) {
         Ok(invites) => Ok(render_json(status::Ok, &invites)),
-        Err(err) => Ok(render_net_error(&err)),
-    }
-}
-
-pub fn accept_invitation(req: &mut Request) -> IronResult<Response> {
-    let mut request = OriginInvitationAcceptRequest::new();
-    request.set_ignore(false);
-    // TODO: SA - Eliminate need to clone the session and params
-    let session = req.extensions.get::<Authenticated>().unwrap().clone();
-    let params = &req.extensions.get::<Router>().unwrap().clone();
-
-    request.set_account_accepting_request(session.get_id());
-    match params.find("invitation_id").unwrap().parse::<u64>() {
-        Ok(value) => request.set_invite_id(value),
-        Err(_) => return Ok(Response::with(status::BadRequest)),
-    }
-
-    let mut conn = Broker::connect().unwrap();
-    match conn.route::<OriginInvitationAcceptRequest, OriginInvitationAcceptResponse>(&request) {
-        Ok(_invites) => {
-            log_event!(req,
-                       Event::OriginInvitationAccept {
-                           id: request.get_invite_id().to_string(),
-                           account: session.get_id().to_string(),
-                       });
-            Ok(Response::with(status::NoContent))
-        }
-        Err(err) => Ok(render_net_error(&err)),
-    }
-}
-
-pub fn ignore_invitation(req: &mut Request) -> IronResult<Response> {
-    let mut request = OriginInvitationAcceptRequest::new();
-    request.set_ignore(true);
-    // TODO: SA - Eliminate need to clone the session and params
-    let session = req.extensions.get::<Authenticated>().unwrap().clone();
-    let params = &req.extensions.get::<Router>().unwrap().clone();
-
-    request.set_account_accepting_request(session.get_id());
-    match params.find("invitation_id").unwrap().parse::<u64>() {
-        Ok(value) => request.set_invite_id(value),
-        Err(_) => return Ok(Response::with(status::BadRequest)),
-    }
-
-    let mut conn = Broker::connect().unwrap();
-    match conn.route::<OriginInvitationAcceptRequest, OriginInvitationAcceptResponse>(&request) {
-        Ok(_invites) => {
-            log_event!(req,
-                       Event::OriginInvitationIgnore {
-                           id: request.get_invite_id().to_string(),
-                           account: session.get_id().to_string(),
-                       });
-            Ok(Response::with(status::NoContent))
-        }
         Err(err) => Ok(render_net_error(&err)),
     }
 }
 
 /// Create a new project as the authenticated user and associated to the given origin
 pub fn project_create(req: &mut Request) -> IronResult<Response> {
-    let mut request = ProjectCreate::new();
-    let mut project = Project::new();
+    let mut request = OriginProjectCreate::new();
+    let mut project = OriginProject::new();
     let mut origin_get = OriginGet::new();
     let github = req.get::<persistent::Read<GitHubCli>>().unwrap();
     let session = req.extensions.get::<Authenticated>().unwrap().clone();
@@ -241,16 +204,15 @@ pub fn project_create(req: &mut Request) -> IronResult<Response> {
                 return Ok(Response::with((status::UnprocessableEntity,
                                           "Missing value for field: `github.repo`")));
             }
-            let mut vcs = VCSGit::new();
             origin_get.set_name(body.origin);
             project.set_plan_path(body.plan_path);
+            project.set_vcs_type(String::from("git"));
             match github.repo(&session.get_token(),
                               &body.github.organization,
                               &body.github.repo) {
-                Ok(repo) => vcs.set_url(repo.clone_url),
+                Ok(repo) => project.set_vcs_data(repo.clone_url),
                 Err(_) => return Ok(Response::with((status::UnprocessableEntity, "rg:pc:1"))),
             }
-            project.set_git(vcs);
             (body.github.organization, body.github.repo)
         }
         _ => return Ok(Response::with(status::UnprocessableEntity)),
@@ -268,13 +230,20 @@ pub fn project_create(req: &mut Request) -> IronResult<Response> {
             match base64::decode(&contents.content) {
                 Ok(ref bytes) => {
                     match Plan::from_bytes(bytes) {
-                        Ok(plan) => project.set_id(format!("{}/{}", origin.get_name(), plan.name)),
+                        Ok(plan) => {
+                            project.set_origin_name(String::from(origin.get_name()));
+                            project.set_origin_id(origin.get_id());
+                            project.set_package_name(String::from(plan.name));
+                        }
                         Err(_) => {
                             return Ok(Response::with((status::UnprocessableEntity, "rg:pc:3")))
                         }
                     }
                 }
-                Err(_) => return Ok(Response::with((status::UnprocessableEntity, "rg:pc:4"))),
+                Err(e) => {
+                    error!("Base64 decode failure: {:?}", e);
+                    return Ok(Response::with((status::UnprocessableEntity, "rg:pc:4")));
+                }
             }
         }
         Err(_) => return Ok(Response::with((status::UnprocessableEntity, "rg:pc:2"))),
@@ -282,7 +251,7 @@ pub fn project_create(req: &mut Request) -> IronResult<Response> {
 
     project.set_owner_id(session.get_id());
     request.set_project(project);
-    match conn.route::<ProjectCreate, Project>(&request) {
+    match conn.route::<OriginProjectCreate, OriginProject>(&request) {
         Ok(response) => {
             log_event!(req,
                        Event::ProjectCreate {
@@ -298,20 +267,27 @@ pub fn project_create(req: &mut Request) -> IronResult<Response> {
 
 /// Delete the given project
 pub fn project_delete(req: &mut Request) -> IronResult<Response> {
-    let mut project_del = ProjectDelete::new();
-    let params = req.extensions.get::<Router>().unwrap();
-    let session = req.extensions.get::<Authenticated>().unwrap();
-    let mut conn = Broker::connect().unwrap();
-    {
-        let origin = params.find("origin").unwrap();
-        if !try!(check_origin_access(&mut conn, session.get_id(), origin)) {
-            return Ok(Response::with(status::Forbidden));
-        }
+    let mut project_del = OriginProjectDelete::new();
+
+    let (session_id, origin) = {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        let session_id = session.get_id();
+
+        let params = req.extensions.get::<Router>().unwrap();
+        let origin = params.find("origin").unwrap().to_owned();
         let name = params.find("name").unwrap();
-        project_del.set_id(format!("{}/{}", origin, name));
+        project_del.set_name(format!("{}/{}", origin, name));
+
+        (session_id, origin)
+    };
+
+    if !try!(check_origin_access(req, session_id, origin)) {
+        return Ok(Response::with(status::Forbidden));
     }
-    project_del.set_requestor_id(session.get_id());
-    match conn.route::<ProjectDelete, NetOk>(&project_del) {
+
+    project_del.set_requestor_id(session_id);
+    let mut conn = Broker::connect().unwrap();
+    match conn.route::<OriginProjectDelete, NetOk>(&project_del) {
         Ok(_) => Ok(Response::with(status::NoContent)),
         Err(err) => Ok(render_net_error(&err)),
     }
@@ -319,9 +295,18 @@ pub fn project_delete(req: &mut Request) -> IronResult<Response> {
 
 /// Update the given project
 pub fn project_update(req: &mut Request) -> IronResult<Response> {
-    let mut request = ProjectUpdate::new();
-    let mut project = Project::new();
+    let mut request = OriginProjectUpdate::new();
+    let mut project = OriginProject::new();
     let github = req.get::<persistent::Read<GitHubCli>>().unwrap();
+
+    let (session_token, session_id) = {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        let session_id = session.get_id();
+        let session_token = session.get_token().to_string();
+
+        (session_token, session_id)
+    };
+
     let (organization, repo) = match req.get::<bodyparser::Struct<ProjectCreateReq>>() {
         Ok(Some(body)) => {
             if body.plan_path.len() <= 0 {
@@ -336,23 +321,18 @@ pub fn project_update(req: &mut Request) -> IronResult<Response> {
                 return Ok(Response::with((status::UnprocessableEntity,
                                           "Missing value for field: `github.repo`")));
             }
-            let session = req.extensions.get::<Authenticated>().unwrap();
-            let mut vcs = VCSGit::new();
+            project.set_vcs_type(String::from("git"));
             project.set_plan_path(body.plan_path);
-            match github.repo(&session.get_token(),
-                              &body.github.organization,
-                              &body.github.repo) {
-                Ok(repo) => vcs.set_url(repo.clone_url),
+            match github.repo(&session_token, &body.github.organization, &body.github.repo) {
+                Ok(repo) => project.set_vcs_data(repo.clone_url),
                 Err(_) => return Ok(Response::with((status::UnprocessableEntity, "rg:pu:1"))),
             }
-            project.set_git(vcs);
             (body.github.organization, body.github.repo)
         }
         _ => return Ok(Response::with(status::UnprocessableEntity)),
     };
     let mut conn = Broker::connect().unwrap();
-    let session = req.extensions.get::<Authenticated>().unwrap();
-    match github.contents(&session.get_token(),
+    match github.contents(&session_token,
                           &organization,
                           &repo,
                           &project.get_plan_path()) {
@@ -361,16 +341,21 @@ pub fn project_update(req: &mut Request) -> IronResult<Response> {
                 Ok(ref bytes) => {
                     match Plan::from_bytes(bytes) {
                         Ok(plan) => {
-                            let params = req.extensions.get::<Router>().unwrap();
-                            let origin = params.find("origin").unwrap();
-                            if !try!(check_origin_access(&mut conn, session.get_id(), origin)) {
+                            let (name, origin) = {
+                                let params = req.extensions.get::<Router>().unwrap();
+                                let origin = params.find("origin").unwrap().to_owned();
+                                let name = params.find("name").unwrap().to_owned();
+
+                                (name, origin)
+                            };
+                            if !try!(check_origin_access(req, session_id, &origin)) {
                                 return Ok(Response::with(status::Forbidden));
                             }
-                            let name = params.find("name").unwrap();
-                            if plan.name != params.find("name").unwrap() {
+                            if plan.name != name {
                                 return Ok(Response::with((status::UnprocessableEntity, "rg:pu:2")));
                             }
-                            project.set_id(format!("{}/{}", origin, name));
+                            project.set_origin_name(String::from(origin));
+                            project.set_package_name(String::from(name));
                         }
                         Err(_) => {
                             return Ok(Response::with((status::UnprocessableEntity, "rg:pu:3")))
@@ -384,10 +369,10 @@ pub fn project_update(req: &mut Request) -> IronResult<Response> {
     }
     // JW TODO: owner_id should *not* be changing but we aren't using it just yet. FIXME before
     // making the project API public.
-    project.set_owner_id(session.get_id());
-    request.set_requestor_id(session.get_id());
+    project.set_owner_id(session_id);
+    request.set_requestor_id(session_id);
     request.set_project(project);
-    match conn.route::<ProjectUpdate, NetOk>(&request) {
+    match conn.route::<OriginProjectUpdate, NetOk>(&request) {
         Ok(_) => Ok(Response::with(status::NoContent)),
         Err(err) => Ok(render_net_error(&err)),
     }
@@ -395,15 +380,15 @@ pub fn project_update(req: &mut Request) -> IronResult<Response> {
 
 /// Display the the given project's details
 pub fn project_show(req: &mut Request) -> IronResult<Response> {
-    let mut project_get = ProjectGet::new();
+    let mut project_get = OriginProjectGet::new();
     let params = req.extensions.get::<Router>().unwrap();
     {
         let origin = params.find("origin").unwrap();
         let name = params.find("name").unwrap();
-        project_get.set_id(format!("{}/{}", origin, name));
+        project_get.set_name(format!("{}/{}", origin, name));
     }
     let mut conn = Broker::connect().unwrap();
-    match conn.route::<ProjectGet, Project>(&project_get) {
+    match conn.route::<OriginProjectGet, OriginProject>(&project_get) {
         Ok(project) => Ok(render_json(status::Ok, &project)),
         Err(err) => Ok(render_net_error(&err)),
     }

@@ -28,26 +28,31 @@ responsibilities as detailed in the [Maintenance Policy](maintenance-policy.md).
 
 ## Components
 
-The various components that make up Habitat.  Each component must have one
+The various components that make up Habitat. Each component must have one
 Lieutenant and may have many maintainers.
 
 ### Core Habitat
 
 #### Lieutenant
 
-* [Adam Jacob](https://github.com/adamhjk)
+* [Jamie Winsor](https://github.com/reset)
 
 #### Maintainers
 
+* [Adam Jacob](https://github.com/adamhjk)
 * [Fletcher Nichol](https://github.com/fnichol)
 * [Dave Parfitt](https://github.com/metadave)
 * [Nathan L Smith](https://github.com/smith)
 * [Joshua Timberman](https://github.com/jtimberman)
-* [Jamie Winsor](https://github.com/reset)
 * [Brian Scott](https://github.com/bscott)
 * [Josh Black](https://github.com/raskchanky)
 * [Steven Murawski](https://github.com/smurawski)
 * [Ian Henry](https://github.com/eeyun)
+* [Justin Carter](https://github.com/bodymindarts)
+* [Matt Wrock](https://github.com/mwrock)
+* [Salim Alam](https://github.com/chefsalim)
+* [Nell Shamrell-Harrington](https://github.com/nellshamrell)
+* [George Marshall](https://github.com/georgemarshall)
 
 ### Habitat Builder Web Application
 
@@ -61,6 +66,9 @@ The web application for the Habitat builder and depot.
 
 * [Fletcher Nichol](https://github.com/fnichol)
 * [Jamie Winsor](https://github.com/reset)
+* [Matt Wrock](https://github.com/mwrock)
+* [Salim Alam](https://github.com/chefsalim)
+* [Nell Shamrell-Harrington](https://github.com/nellshamrell)
 
 ### Habitat Builder
 
@@ -76,6 +84,9 @@ The web application for the Habitat builder and depot.
 * [Brian Scott](https://github.com/bscott)
 * [Steven Murawski](https://github.com/smurawski)
 * [Ian Henry](https://github.com/eeyun)
+* [Matt Wrock](https://github.com/mwrock)
+* [Salim Alam](https://github.com/chefsalim)
+* [Nell Shamrell-Harrington](https://github.com/nellshamrell)
 
 ### Documentation
 
@@ -92,3 +103,8 @@ tutorials and reference materials.
 * [Ryan Keairns](https://github.com/ryankeairns)
 * [Brian Scott](https://github.com/bscott)
 * [Ian Henry](https://github.com/eeyun)
+* [Jamie Winsor](https://github.com/reset)
+* [Matt Wrock](https://github.com/mwrock)
+* [Salim Alam](https://github.com/chefsalim)
+* [Nell Shamrell-Harrington](https://github.com/nellshamrell)
+* [Robb Kidd](https://github.com/robbkidd)

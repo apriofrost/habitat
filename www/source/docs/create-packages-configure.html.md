@@ -100,10 +100,10 @@ Helpers can also be nested and used together in block expressions. Here is anoth
 
 Here's an example using `each` to render multiple server entries:
 
-    {{~#each cfg.servers}}
+    {{~#each cfg.servers as |server| }}
     server {
-      host {{host}}
-      port {{port}}
+      host {{server.host}}
+      port {{server.port}}
     }
     {{~/each}}
 
@@ -127,6 +127,7 @@ Habitat's templating flavour includes a number of useful helpers for writing con
 * [`toUppercase`](#touppercase-helper)
 * [`strReplace`](#strreplace-helper)
 * [`pkgPathFor`](#pkgpathfor-helper)
+* [`eachAlive`](#eachalive-helper)
 * [`toJson`](#tojson-helper)
 * [`toToml`](#totoml-helper)
 
@@ -155,6 +156,16 @@ This sets `my_value` to "this is new".
 Returns the absolute filepath to the package directory of the package best resolved from the given package identifier. The `pkgPathFor` helper will only resolve against dependent packages of the package the template belongs to - in other words, you will always get what you expect and the template won't leak to other packages on the system.
 
     export JAVA_HOME={{pkgPathFor "core/jre8"}}
+
+### eachAlive Helper
+
+Iterates over a collection of members and renders the template for members that are marked alive.
+
+    {{#if bind.has_backend }}
+    {{~#eachAlive bind.backend.members}}
+    server ip {{ip}}:{{port}}
+    {{~/eachAlive}}
+    {{~/if}}
 
 ### toJson Helper
 

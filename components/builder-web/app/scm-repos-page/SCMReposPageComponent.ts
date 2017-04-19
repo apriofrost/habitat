@@ -16,13 +16,10 @@ import {Component, OnInit} from "@angular/core";
 import {AppStore} from "../AppStore";
 import {fetchGitHubOrgs, fetchGitHubRepos,
         onGitHubOrgSelect, setSelectedGitHubOrg, resetRedirectRoute} from "../actions/index";
-import {GitHubRepoPickerComponent} from
-    "../github-repo-picker/GitHubRepoPickerComponent";
 import {requireSignIn} from "../util";
 import {Router} from "@angular/router";
 
 @Component({
-    directives: [GitHubRepoPickerComponent],
     template: `
     <div class="hab-scm-repos">
       <div class="page-title">
@@ -38,7 +35,7 @@ import {Router} from "@angular/router";
           </p>
       </div>
       <div class="page-body">
-          <github-repo-picker [areOrgsLoading]="gitHub.ui.orgs.loading"
+          <hab-github-repo-picker [areOrgsLoading]="gitHub.ui.orgs.loading"
                               [areReposLoading]="gitHub.ui.repos.loading"
                               [fetchGitHubOrgs]="fetchGitHubOrgs"
                               [fetchGitHubRepos]="fetchGitHubRepos"
@@ -48,16 +45,16 @@ import {Router} from "@angular/router";
                               [onRepoSelect]="onRepoSelect"
                               [selectedOrg]="gitHub.selectedOrg"
                               [user]="user">
-          </github-repo-picker>
+          </hab-github-repo-picker>
       </div>
     </div>`
 })
 
 export class SCMReposPageComponent implements OnInit {
-    private fetchGitHubOrgs: Function;
-    private fetchGitHubRepos: Function;
-    private onOrgSelect: Function;
-    private onRepoSelect: Function;
+    fetchGitHubOrgs: Function;
+    fetchGitHubRepos: Function;
+    onOrgSelect: Function;
+    onRepoSelect: Function;
 
     constructor(private store: AppStore, private router: Router) {
         this.fetchGitHubOrgs = () => {

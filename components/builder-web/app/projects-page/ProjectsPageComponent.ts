@@ -13,13 +13,11 @@
 // limitations under the License.
 
 import {Component, OnInit} from "@angular/core";
-import {RouterLink} from "@angular/router";
 import {fetchProjects} from "../actions/index";
 import {AppStore} from "../AppStore";
 import {requireSignIn} from "../util";
 
 @Component({
-    directives: [RouterLink],
     template: `
     <div class="hab-projects">
         <div class="page-title">
@@ -29,7 +27,7 @@ import {requireSignIn} from "../util";
         <div class="page-body">
             <ul class="hab-projects-list">
                 <li *ngIf="projects.size === 0">
-                    You do not have any Projects yet.
+                    You do not have any projects yet.
                 </li>
                 <li *ngFor="let project of projects">
                     <a [routerLink]="['/projects', project.origin, project.name]" class="hab-item-list" href="#">

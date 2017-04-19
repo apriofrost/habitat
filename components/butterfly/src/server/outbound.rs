@@ -52,16 +52,16 @@ impl fmt::Display for AckFrom {
 }
 
 /// The outbound thread
-pub struct Outbound<'a> {
-    pub server: &'a Server,
+pub struct Outbound {
+    pub server: Server,
     pub socket: UdpSocket,
     pub rx_inbound: mpsc::Receiver<(SocketAddr, Swim)>,
     pub timing: Timing,
 }
 
-impl<'a> Outbound<'a> {
+impl Outbound {
     /// Creates a new Outbound struct.
-    pub fn new(server: &'a Server,
+    pub fn new(server: Server,
                socket: UdpSocket,
                rx_inbound: mpsc::Receiver<(SocketAddr, Swim)>,
                timing: Timing)
@@ -90,13 +90,15 @@ impl<'a> Outbound<'a> {
                 if self.server.member_list.len() >= min_to_start {
                     have_members = true;
                 } else {
-                    self.server.member_list.with_initial_members(|member| {
-                        ping(&self.server,
-                             &self.socket,
-                             &member,
-                             member.swim_socket_address(),
-                             None);
-                    });
+                    self.server
+                        .member_list
+                        .with_initial_members(|member| {
+                                                  ping(&self.server,
+                                                       &self.socket,
+                                                       &member,
+                                                       member.swim_socket_address(),
+                                                       None);
+                                              });
                 }
             }
 
@@ -112,10 +114,10 @@ impl<'a> Outbound<'a> {
             let check_list = self.server
                 .member_list
                 .check_list(self.server
-                    .member
-                    .read()
-                    .expect("Member is poisoned")
-                    .get_id());
+                                .member
+                                .read()
+                                .expect("Member is poisoned")
+                                .get_id());
 
             for member in check_list {
                 if self.server.member_list.pingable(&member) {
@@ -168,7 +170,7 @@ impl<'a> Outbound<'a> {
         trace_it!(PROBE: &self.server, TraceKind::ProbeBegin, member.get_id(), addr);
 
         // Ping the member, and wait for the ack.
-        ping(self.server, &self.socket, &member, addr, None);
+        ping(&self.server, &self.socket, &member, addr, None);
         if self.recv_ack(&member, addr, AckFrom::Ping) {
             trace_it!(PROBE: &self.server, TraceKind::ProbeAckReceived, member.get_id(), addr);
             trace_it!(PROBE: &self.server, TraceKind::ProbeComplete, member.get_id(), addr);
@@ -182,7 +184,7 @@ impl<'a> Outbound<'a> {
                           TraceKind::ProbePingReq,
                           pingreq_target.get_id(),
                           pingreq_target.get_address());
-                pingreq(self.server, &self.socket, &pingreq_target, &member);
+                pingreq(&self.server, &self.socket, &pingreq_target, &member);
             });
         if !self.recv_ack(&member, addr, AckFrom::PingReq) {
             // We mark as suspect when we fail to get a response from the PingReq. That moves us
@@ -252,7 +254,9 @@ pub fn populate_membership_rumors(server: &Server, target: &Member, swim: &mut S
         let always_target = server.member_list.membership_for(target.get_id());
         membership_entries.push(always_target);
     }
-    let rumors = server.rumor_list.take_by_kind(target.get_id(), 5, Rumor_Type::Member);
+    let rumors = server
+        .rumor_list
+        .take_by_kind(target.get_id(), 5, Rumor_Type::Member);
     for &(ref rkey, _heat) in rumors.iter() {
         membership_entries.push(server.member_list.membership_for(&rkey.key()));
     }

@@ -1,7 +1,7 @@
 # Habitat
 
 [![Build Status](https://api.travis-ci.org/habitat-sh/habitat.svg?branch=master)](https://travis-ci.org/habitat-sh/habitat)
-[![AppVeyor Build status](https://ci.appveyor.com/api/projects/status/ttt9p6r4q6fcipwb/branch/master?svg=true)](https://ci.appveyor.com/project/habitat/habitat/branch/master)
+[![Build status](https://ci.appveyor.com/api/projects/status/ejn8d6bkhiml16al/branch/master?svg=true)](https://ci.appveyor.com/project/chef/habitat/branch/master)
 [![Slack](http://slack.habitat.sh/badge.svg)](http://slack.habitat.sh/)
 
 Want to try Habitat? [Get started here](https://www.habitat.sh/try/).
@@ -21,6 +21,23 @@ applications that:
 * Are language agnostic
 
 To learn more about Habitat, please visit the [Habitat website](https://www.habitat.sh).
+
+## Installation
+
+There are a couple of different way to install Habitat.
+
+You can download it from the [Habitat downloads page](https://www.habitat.sh/docs/get-habitat/).
+
+Once you have downloaded it, follow the instructions on the page for your specific operating system.
+
+If you are running on a Mac or Linux, you can also use the Habitat install script.
+
+```
+  $ curl https://raw.githubusercontent.com/habitat-sh/habitat/master/components/hab/install.sh | sudo bash
+```
+
+###
+
 
 ## Web Application
 
@@ -43,9 +60,11 @@ See [BUILDING.md](BUILDING.md) for platform specific info on building Habitat fr
 * [Rust by Example](http://rustbyexample.com/)
 * [Introduction to Bash programming](http://tldp.org/HOWTO/Bash-Prog-Intro-HOWTO.html)
 * [Advanced Bash-Scripting Guide](http://www.tldp.org/LDP/abs/html/)
+* [Bash Cheat Sheet](http://tldp.org/LDP/abs/html/refcards.html)
 * [Writing Robust Bash Shell Scripts](http://www.davidpashley.com/articles/writing-robust-shell-scripts/)
 * [Wikibook: Bourne Shell Scripting](https://en.wikibooks.org/wiki/Bourne_Shell_Scripting)
 * [What is the difference between test, \[ and \[\[ ?](http://mywiki.wooledge.org/BashFAQ/031)
+* [POSIX Shell Command Language](http://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html)
 
 
 ## License

@@ -14,12 +14,9 @@
 
 import {AppStore} from "../AppStore";
 import {Component} from "@angular/core";
-import {GravatarComponent} from "../GravatarComponent";
-import {RouterLink} from "@angular/router";
 import {icon, requireSignIn} from "../util";
 
 @Component({
-    directives: [GravatarComponent, RouterLink],
     template: `
     <div class="hab-organizations">
       <div class="page-title">
@@ -60,7 +57,7 @@ import {icon, requireSignIn} from "../util";
                   <li *ngFor="let org of orgs">
                       <a href="#" class="hab-item-list">
                           <div class="item-title">
-                              <gravatar size=32 email="{{org.email}}"></gravatar>
+                              <hab-gravatar size=32 email="{{org.email}}"></hab-gravatar>
                               <h3>
                                   {{org.name}}
                               </h3>
@@ -86,5 +83,5 @@ export class OrganizationsPageComponent {
 
     get orgs() { return this.store.getState().orgs.all; }
 
-    private icon(x) { return icon(x); }
+    icon(x) { return icon(x); }
 }

@@ -8,7 +8,7 @@ pkg_bin_dirs=(bin)
 pkg_deps=(core/glibc core/openssl core/coreutils core/gcc-libs core/zeromq core/libsodium
   core/libarchive)
 pkg_build_deps=(core/protobuf core/protobuf-rust core/coreutils core/cacerts
-  core/rust core/gcc core/git core/pkg-config core/node core/phantomjs)
+  core/rust core/gcc core/git core/pkg-config core/node core/phantomjs core/python2 core/make)
 pkg_exports=(
   [port]=srv.port
 )
@@ -18,10 +18,7 @@ pkg_svc_run="$bin start -c ${pkg_svc_path}/config.toml"
 
 do_verify() {
   pushd $PLAN_CONTEXT/../../.. > /dev/null
-  pkg_version=`git rev-list master --count`
-  pkg_dirname="${pkg_name}-${pkg_version}"
-  pkg_prefix="$HAB_PKG_PATH/${pkg_origin}/${pkg_name}/${pkg_version}/${pkg_release}"
-  pkg_artifact="$HAB_CACHE_ARTIFACT_PATH/${pkg_origin}-${pkg_name}-${pkg_version}-${pkg_release}-${pkg_target}.${_artifact_ext}"
+  update_pkg_version
   popd > /dev/null
 }
 
@@ -65,7 +62,6 @@ do_build() {
     echo $b
     fix_interpreter $(readlink -f -n $b) core/coreutils bin/env
   done
-  npm run postinstall
   npm run dist
   popd > /dev/null
 
@@ -84,6 +80,25 @@ do_install() {
 do_strip() {
   if [[ "$build_type" != "--debug" ]]; then
     do_default_strip
+  fi
+}
+
+update_pkg_version() {
+  # Update the `$pkg_version` using Git to determine the value
+  pkg_version="$(git rev-list master --count)"
+  build_line "Version updated to $pkg_version"
+
+  # Several metadata values get their defaults from the value of `$pkg_version`
+  # so we must update these as well
+  pkg_dirname=${pkg_name}-${pkg_version}
+  pkg_prefix=$HAB_PKG_PATH/${pkg_origin}/${pkg_name}/${pkg_version}/${pkg_release}
+  pkg_artifact="$HAB_CACHE_ARTIFACT_PATH/${pkg_origin}-${pkg_name}-${pkg_version}-${pkg_release}-${pkg_target}.${_artifact_ext}"
+  if [[ "$CACHE_PATH" == "$SRC_PATH" ]]; then
+    local update_src_path=true
+  fi
+  CACHE_PATH="$HAB_CACHE_SRC_PATH/$pkg_dirname"
+  if [[ "${update_src_path:-}" == true ]]; then
+    SRC_PATH="$CACHE_PATH"
   fi
 }
 

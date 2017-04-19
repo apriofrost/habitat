@@ -47,7 +47,12 @@ fn docker_cmd(args: &[&str]) -> Docker {
 }
 
 pub fn depot(image: &str) -> Docker {
-    docker_cmd(&["run", "-d", "--cap-add=NET_ADMIN", "--expose=9632", image, "depot"])
+    docker_cmd(&["run",
+                 "-d",
+                 "--cap-add=NET_ADMIN",
+                 "--expose=9632",
+                 image,
+                 "depot"])
 }
 
 impl Docker {
@@ -58,7 +63,7 @@ impl Docker {
                                               "{{range .NetworkSettings.Networks}}{{.\
                                                IPAddress}}{{end}}",
                                               &self.container_id)])
-            .unwrap_or_else(|x| panic!("{:?}", x));
+                .unwrap_or_else(|x| panic!("{:?}", x));
         cmd.wait_with_output();
         let ipaddress = String::from(cmd.stdout().trim());
         println!("I have ipaddress {}", &ipaddress);

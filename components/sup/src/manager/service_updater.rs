@@ -21,18 +21,16 @@ use std::time::Duration;
 use butterfly;
 use common::ui::UI;
 use depot_client;
-use hcore::package::PackageIdent;
+use hcore::package::{PackageIdent, PackageInstall};
 use hcore::service::ServiceGroup;
 use hcore::crypto::default_cache_key_path;
 use hcore::fs::{CACHE_ARTIFACT_PATH, FS_ROOT_PATH};
 use time::{SteadyTime, Duration as TimeDuration};
 
 use {PRODUCT, VERSION};
-use config::gconfig;
 use error::Result;
 use manager::census::CensusList;
 use manager::service::{Service, Topology, UpdateStrategy};
-use package::Package;
 
 static LOGKEY: &'static str = "SU";
 const UPDATE_STRATEGY_FREQUENCY_MS: i64 = 60_000;
@@ -40,7 +38,7 @@ const UPDATE_STRATEGY_FREQUENCY_MS: i64 = 60_000;
 type UpdaterStateList = HashMap<ServiceGroup, UpdaterState>;
 
 enum UpdaterState {
-    AtOnce(Receiver<Package>),
+    AtOnce(Receiver<PackageInstall>),
     Rolling(RollingState),
 }
 
@@ -52,13 +50,13 @@ enum RollingState {
 }
 
 enum LeaderState {
-    Polling(Receiver<Package>),
+    Polling(Receiver<PackageInstall>),
     Waiting,
 }
 
 enum FollowerState {
     Waiting,
-    Updating(Receiver<Package>),
+    Updating(Receiver<PackageInstall>),
 }
 
 pub struct ServiceUpdater {
@@ -78,10 +76,13 @@ impl ServiceUpdater {
         match service.update_strategy {
             UpdateStrategy::None => false,
             UpdateStrategy::AtOnce => {
-                self.states.entry(service.service_group.clone()).or_insert_with(|| {
-                    let rx = Worker::new(service).start(&service.service_group, None);
-                    UpdaterState::AtOnce(rx)
-                });
+                self.states
+                    .entry(service.service_group.clone())
+                    .or_insert_with(|| {
+                                        let rx = Worker::new(service)
+                                            .start(&service.service_group, None);
+                                        UpdaterState::AtOnce(rx)
+                                    });
                 true
             }
             UpdateStrategy::Rolling => {
@@ -97,12 +98,12 @@ impl ServiceUpdater {
                                      service: &mut Service,
                                      census_list: &CensusList)
                                      -> bool {
+        let mut updated = false;
         match self.states.get_mut(&service.service_group) {
             Some(&mut UpdaterState::AtOnce(ref mut rx)) => {
                 match rx.try_recv() {
                     Ok(package) => {
-                        service.package = package;
-                        service.needs_restart = true;
+                        service.update_package(package);
                         return true;
                     }
                     Err(TryRecvError::Empty) => return false,
@@ -134,7 +135,8 @@ impl ServiceUpdater {
                         }
                     } else {
                         debug!("Rolling update, using default suitability");
-                        self.butterfly.start_update_election(service.service_group.clone(), 0, 0);
+                        self.butterfly
+                            .start_update_election(service.service_group.clone(), 0, 0);
                         *st = RollingState::InElection;
                     }
                 }
@@ -164,8 +166,8 @@ impl ServiceUpdater {
                         match rx.try_recv() {
                             Ok(package) => {
                                 debug!("Rolling Update, polling found a new package");
-                                service.package = package;
-                                service.needs_restart = true;
+                                service.update_package(package);
+                                updated = true;
                             }
                             Err(TryRecvError::Empty) => return false,
                             Err(TryRecvError::Disconnected) => {
@@ -178,10 +180,13 @@ impl ServiceUpdater {
                     LeaderState::Waiting => {
                         match census_list.get(&*service.service_group) {
                             Some(census) => {
-                                if census.members_ordered().iter().any(|ce| {
-                                    ce.pkg.as_ref().unwrap() !=
-                                    census.me().unwrap().pkg.as_ref().unwrap()
-                                }) {
+                                if census
+                                       .members_ordered()
+                                       .iter()
+                                       .any(|ce| {
+                                                ce.pkg.as_ref().unwrap() !=
+                                                census.me().unwrap().pkg.as_ref().unwrap()
+                                            }) {
                                     debug!("Update leader still waiting for followers...");
                                     return false;
                                 }
@@ -195,7 +200,7 @@ impl ServiceUpdater {
                         }
                     }
                 }
-                if service.needs_restart {
+                if updated {
                     *state = LeaderState::Waiting;
                 }
             }
@@ -217,8 +222,9 @@ impl ServiceUpdater {
                                             return false;
                                         }
                                         debug!("We're in an update and it's our turn");
-                                        let rx = Worker::new(service)
-                                            .start(&service.service_group, leader.pkg.clone());
+                                        let rx =
+                                            Worker::new(service).start(&service.service_group,
+                                                                       leader.pkg.clone());
                                         *state = FollowerState::Updating(rx);
                                     }
                                     _ => return false,
@@ -235,19 +241,17 @@ impl ServiceUpdater {
                             Some(census) => {
                                 match rx.try_recv() {
                                     Ok(package) => {
-                                        service.package = package;
-                                        service.needs_restart = true;
+                                        service.update_package(package);
+                                        updated = true
                                     }
                                     Err(TryRecvError::Empty) => return false,
                                     Err(TryRecvError::Disconnected) => {
                                         outputln!(preamble service.service_group,
                                             "Service Updater has died {}", "; restarting...");
-                                        let package = census.get_update_leader()
-                                            .unwrap()
-                                            .pkg
-                                            .clone();
-                                        *rx = Worker::new(service)
-                                            .start(&service.service_group, package);
+                                        let package =
+                                            census.get_update_leader().unwrap().pkg.clone();
+                                        *rx = Worker::new(service).start(&service.service_group,
+                                                                         package);
                                     }
                                 }
                             }
@@ -258,27 +262,29 @@ impl ServiceUpdater {
                         }
                     }
                 }
-                if service.needs_restart {
+                if updated {
                     *state = FollowerState::Waiting;
                 }
             }
             None => {}
         }
-        service.needs_restart
+        updated
     }
 }
 
 struct Worker {
     current: PackageIdent,
+    spec_ident: PackageIdent,
     depot: depot_client::Client,
     ui: UI,
 }
 
 impl Worker {
-    pub fn new(service: &Service) -> Self {
+    fn new(service: &Service) -> Self {
         Worker {
-            current: service.package.ident().clone(),
-            depot: depot_client::Client::new(gconfig().url(), PRODUCT, VERSION, None).unwrap(),
+            current: service.package().ident().clone(),
+            spec_ident: service.spec_ident.clone(),
+            depot: depot_client::Client::new(&service.depot_url, PRODUCT, VERSION, None).unwrap(),
             ui: UI::default(),
         }
     }
@@ -288,19 +294,19 @@ impl Worker {
     /// Passing an optional package identifier will make the worker perform a run-once update to
     /// retrieve a specific version from a remote Depot. If no package identifier is specified,
     /// then the updater will poll until a newer more suitable package is found.
-    pub fn start(mut self, sg: &ServiceGroup, ident: Option<PackageIdent>) -> Receiver<Package> {
+    fn start(mut self, sg: &ServiceGroup, ident: Option<PackageIdent>) -> Receiver<PackageInstall> {
         let (tx, rx) = sync_channel(0);
         thread::Builder::new()
             .name(format!("service-updater-{}", sg))
             .spawn(move || match ident {
-                Some(latest) => self.run_once(tx, latest),
-                None => self.run_poll(tx),
-            })
+                       Some(latest) => self.run_once(tx, latest),
+                       None => self.run_poll(tx),
+                   })
             .expect("unable to start service-updater thread");
         rx
     }
 
-    fn run_once(&mut self, sender: SyncSender<Package>, ident: PackageIdent) {
+    fn run_once(&mut self, sender: SyncSender<PackageInstall>, ident: PackageIdent) {
         outputln!("Updating from {} to {}", self.current, ident);
         loop {
             let next_check = SteadyTime::now() +
@@ -320,15 +326,11 @@ impl Worker {
         }
     }
 
-    fn run_poll(&mut self, sender: SyncSender<Package>) {
+    fn run_poll(&mut self, sender: SyncSender<PackageInstall>) {
         loop {
             let next_check = SteadyTime::now() +
                              TimeDuration::milliseconds(UPDATE_STRATEGY_FREQUENCY_MS);
-            // TODO fn: We don't want to reach into a global config for the package argument given
-            // to the `start` subcommand. Instead, each Service will have this peice of information
-            // but for the moment we're going to go global.
-            let initial_ident = gconfig().package();
-            match self.depot.show_package(initial_ident) {
+            match self.depot.show_package(&self.spec_ident) {
                 Ok(remote) => {
                     let latest: PackageIdent = remote.get_ident().clone().into();
                     if latest > self.current {
@@ -354,28 +356,30 @@ impl Worker {
         }
     }
 
-    fn install(&mut self, package: &PackageIdent, recurse: bool) -> Result<Package> {
-        let package = match Package::load(package, Some(&*FS_ROOT_PATH)) {
+    fn install(&mut self, package: &PackageIdent, recurse: bool) -> Result<PackageInstall> {
+        let package = match PackageInstall::load(package, Some(&*FS_ROOT_PATH)) {
             Ok(pkg) => pkg,
             Err(_) => try!(self.download(package)),
         };
         if recurse {
-            for ident in package.tdeps.iter() {
+            for ident in package.tdeps()?.iter() {
                 try!(self.install(&ident, false));
             }
         }
         Ok(package)
     }
 
-    fn download(&mut self, package: &PackageIdent) -> Result<Package> {
+    fn download(&mut self, package: &PackageIdent) -> Result<PackageInstall> {
         outputln!("Downloading {}", package);
-        let mut archive = try!(self.depot.fetch_package(package,
-                                                        &Path::new(&*FS_ROOT_PATH)
-                                                            .join(CACHE_ARTIFACT_PATH),
-                                                        self.ui.progress()));
+        let mut archive = try!(self.depot
+                                   .fetch_package(package,
+                                                  &Path::new(&*FS_ROOT_PATH)
+                                                       .join(CACHE_ARTIFACT_PATH),
+                                                  self.ui.progress()));
         try!(archive.verify(&default_cache_key_path(None)));
         outputln!("Installing {}", package);
         try!(archive.unpack(None));
-        Package::load(archive.ident().as_ref().unwrap(), Some(&*FS_ROOT_PATH))
+        let pkg = PackageInstall::load(archive.ident().as_ref().unwrap(), Some(&*FS_ROOT_PATH))?;
+        Ok(pkg)
     }
 }

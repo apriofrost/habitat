@@ -47,7 +47,7 @@ use hyper::status::StatusCode;
 use hyper::header::{Authorization, Bearer};
 use hyper::Url;
 use protobuf::core::ProtobufEnum;
-use protocol::{depotsrv, net};
+use protocol::{originsrv, net};
 use rand::{Rng, thread_rng};
 use tee::TeeReader;
 
@@ -77,9 +77,9 @@ pub struct OriginKeyIdent {
     pub location: String,
 }
 
-impl Into<depotsrv::OriginKeyIdent> for OriginKeyIdent {
-    fn into(self) -> depotsrv::OriginKeyIdent {
-        let mut out = depotsrv::OriginKeyIdent::new();
+impl Into<originsrv::OriginKeyIdent> for OriginKeyIdent {
+    fn into(self) -> originsrv::OriginKeyIdent {
+        let mut out = originsrv::OriginKeyIdent::new();
         out.set_origin(self.origin);
         out.set_revision(self.revision);
         out.set_location(self.location);
@@ -89,12 +89,12 @@ impl Into<depotsrv::OriginKeyIdent> for OriginKeyIdent {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OriginSecretKey {
-    pub id: String,
-    pub origin_id: String,
+    pub id: u64,
+    pub origin_id: u64,
     pub name: String,
     pub revision: String,
-    pub body: String,
-    pub owner_id: String,
+    pub body: Vec<u8>,
+    pub owner_id: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -108,9 +108,9 @@ pub struct Package {
     pub config: String,
 }
 
-impl Into<depotsrv::Package> for Package {
-    fn into(self) -> depotsrv::Package {
-        let mut out = depotsrv::Package::new();
+impl Into<originsrv::OriginPackage> for Package {
+    fn into(self) -> originsrv::OriginPackage {
+        let mut out = originsrv::OriginPackage::new();
         out.set_ident(self.ident.into());
         out.set_checksum(self.checksum);
         out.set_manifest(self.manifest);
@@ -130,9 +130,9 @@ pub struct PackageIdent {
     pub release: String,
 }
 
-impl Into<depotsrv::PackageIdent> for PackageIdent {
-    fn into(self) -> depotsrv::PackageIdent {
-        let mut out = depotsrv::PackageIdent::new();
+impl Into<originsrv::OriginPackageIdent> for PackageIdent {
+    fn into(self) -> originsrv::OriginPackageIdent {
+        let mut out = originsrv::OriginPackageIdent::new();
         out.set_origin(self.origin);
         out.set_name(self.name);
         out.set_version(self.version);
@@ -189,8 +189,10 @@ impl Client {
                       progress)
     }
 
-    pub fn show_origin_keys(&self, origin: &str) -> Result<Vec<depotsrv::OriginKeyIdent>> {
-        let mut res = try!(self.inner.get(&format!("origins/{}/keys", origin)).send());
+    pub fn show_origin_keys(&self, origin: &str) -> Result<Vec<originsrv::OriginKeyIdent>> {
+        let mut res = try!(self.inner
+                               .get(&format!("origins/{}/keys", origin))
+                               .send());
         debug!("Response: {:?}", res);
 
         if res.status != StatusCode::Ok {
@@ -200,7 +202,7 @@ impl Client {
         let mut encoded = String::new();
         try!(res.read_to_string(&mut encoded));
         debug!("Response body: {:?}", encoded);
-        let revisions: Vec<depotsrv::OriginKeyIdent> =
+        let revisions: Vec<originsrv::OriginKeyIdent> =
             try!(serde_json::from_str::<Vec<OriginKeyIdent>>(&encoded))
                 .into_iter()
                 .map(|m| m.into())
@@ -249,7 +251,7 @@ impl Client {
                     Err(Error::APIError(response.status,
                                         "Your GitHub token requires both user:email and read:org \
                                          permissions."
-                                            .to_string()))
+                                                .to_string()))
                 } else {
                     Err(err_from_response(response))
                 }
@@ -269,10 +271,11 @@ impl Client {
     ///
     /// * Authorization token was not set on client
     pub fn fetch_origin_secret_key(&self, origin: &str, token: &str) -> Result<OriginSecretKey> {
-        let mut res =
-            try!(self.add_authz(self.inner.get(&format!("origins/{}/secret_keys/latest", origin)),
-                           token)
-                .send());
+        let mut res = try!(self.add_authz(self.inner
+                                              .get(&format!("origins/{}/secret_keys/latest",
+                                                            origin)),
+                                          token)
+                               .send());
         if res.status != StatusCode::Ok {
             return Err(err_from_response(res));
         }
@@ -361,7 +364,7 @@ impl Client {
     ///
     /// * Package cannot be found
     /// * Remote Depot is not available
-    pub fn show_package<I: Identifiable>(&self, ident: &I) -> Result<depotsrv::Package> {
+    pub fn show_package<I: Identifiable>(&self, ident: &I) -> Result<originsrv::OriginPackage> {
         let mut res = try!(self.inner.get(&self.path_show_package(ident)).send());
 
         if res.status != StatusCode::Ok {
@@ -371,7 +374,8 @@ impl Client {
         let mut encoded = String::new();
         try!(res.read_to_string(&mut encoded));
         debug!("Body: {:?}", encoded);
-        let package: depotsrv::Package = try!(serde_json::from_str::<Package>(&encoded)).into();
+        let package: originsrv::OriginPackage = try!(serde_json::from_str::<Package>(&encoded))
+            .into();
         Ok(package)
     }
 
@@ -424,7 +428,11 @@ impl Client {
         let mut file = try!(File::open(&pa.path));
         let file_size = try!(file.metadata()).len();
         let path = format!("pkgs/{}", ident);
-        let custom = |url: &mut Url| { url.query_pairs_mut().append_pair("checksum", &checksum); };
+        let custom = |url: &mut Url| {
+            url.query_pairs_mut()
+                .append_pair("checksum", &checksum)
+                .append_pair("builder", "");
+        };
         debug!("Reading from {}", &pa.path.display());
 
         let result = self.add_authz(self.inner.post_with_custom_url(&path, custom), token)
@@ -437,6 +445,39 @@ impl Client {
         }
     }
 
+    /// Promote a package to a given channel
+    ///
+    /// # Failures
+    ///
+    /// * Remote Depot is not available
+    ///
+    /// # Panics
+    /// * If package archive does not have a version/release
+    /// * Authorization token was not set on client
+    pub fn promote_package(&self,
+                           pa: &mut PackageArchive,
+                           channel: &str,
+                           token: &str)
+                           -> Result<()> {
+        let ident = try!(pa.ident());
+        let path = format!("channels/{}/{}/pkgs/{}/{}/{}/promote",
+                           ident.origin,
+                           channel,
+                           ident.name,
+                           ident.version.unwrap(),
+                           ident.release.unwrap());
+
+        debug!("Promoting package, path: {}", path);
+
+        let res = self.add_authz(self.inner.put(&path), token).send()?;
+
+        if res.status != StatusCode::Ok {
+            return Err(err_from_response(res));
+        };
+
+        Ok(())
+    }
+
     /// Returns a vector of PackageIdent structs
     ///
     /// # Failures
@@ -446,7 +487,9 @@ impl Client {
                           search_term: String)
                           -> Result<(Vec<hab_core::package::PackageIdent>, bool)> {
 
-        let mut res = try!(self.inner.get(&format!("pkgs/search/{}", search_term)).send());
+        let mut res = try!(self.inner
+                               .get(&format!("pkgs/search/{}", search_term))
+                               .send());
         match res.status {
             StatusCode::Ok |
             StatusCode::PartialContent => {
@@ -488,17 +531,20 @@ impl Client {
             Some(filename) => format!("{}", filename),
             None => return Err(Error::NoXFilename),
         };
-        let tmp_file_path =
-            dst_path.join(format!("{}.tmp-{}",
-                                  file_name,
-                                  thread_rng().gen_ascii_chars().take(8).collect::<String>()));
+        let tmp_file_path = dst_path.join(format!("{}.tmp-{}",
+                                                  file_name,
+                                                  thread_rng()
+                                                      .gen_ascii_chars()
+                                                      .take(8)
+                                                      .collect::<String>()));
         let dst_file_path = dst_path.join(file_name);
         debug!("Writing to {}", &tmp_file_path.display());
         let mut f = try!(File::create(&tmp_file_path));
         match progress {
             Some(mut progress) => {
-                let size: u64 =
-                    res.headers.get::<hyper::header::ContentLength>().map_or(0, |v| **v);
+                let size: u64 = res.headers
+                    .get::<hyper::header::ContentLength>()
+                    .map_or(0, |v| **v);
                 progress.size(size);
                 let mut writer = BroadcastWriter::new(&mut f, progress);
                 try!(io::copy(&mut res, &mut writer))

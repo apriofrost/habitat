@@ -16,6 +16,7 @@
 extern crate bitflags;
 extern crate fnv;
 extern crate habitat_builder_protocol as protocol;
+extern crate habitat_core as core;
 #[macro_use]
 extern crate hyper;
 extern crate hyper_openssl;
@@ -23,7 +24,6 @@ extern crate hyper_openssl;
 extern crate iron;
 #[macro_use]
 extern crate lazy_static;
-extern crate libc;
 #[macro_use]
 extern crate log;
 extern crate num_cpus;
@@ -55,9 +55,9 @@ pub use self::supervisor::Supervisor;
 
 pub fn hostname() -> Result<String> {
     let output = try!(Command::new("sh")
-        .arg("-c")
-        .arg("hostname | awk '{printf \"%s\", $NF; exit}'")
-        .output());
+                          .arg("-c")
+                          .arg("hostname | awk '{printf \"%s\", $NF; exit}'")
+                          .output());
     match output.status.success() {
         true => {
             debug!("Hostname address is {}",

@@ -38,14 +38,14 @@ const FANOUT: usize = 5;
 
 /// The Push server
 #[derive(Debug)]
-pub struct Push<'a> {
-    pub server: &'a Server,
+pub struct Push {
+    pub server: Server,
     pub timing: Timing,
 }
 
-impl<'a> Push<'a> {
+impl Push {
     /// Creates a new Push instance from a Server and Timing
-    pub fn new(server: &'a Server, timing: Timing) -> Push {
+    pub fn new(server: Server, timing: Timing) -> Push {
         Push {
             server: server,
             timing: timing,
@@ -65,7 +65,9 @@ impl<'a> Push<'a> {
 
             self.server.update_gossip_round();
 
-            let mut check_list = self.server.member_list.check_list(self.server.member_id());
+            let mut check_list = self.server
+                .member_list
+                .check_list(self.server.member_id());
             let long_wait = self.timing.gossip_timeout();
 
             'fanout: loop {
@@ -89,30 +91,33 @@ impl<'a> Push<'a> {
                     // persistent members that are confirmed dead. When the failure detector thread
                     // finds them alive again, we'll go ahead and get back to the business at hand.
                     if self.server.member_list.pingable(&member) &&
-                       !self.server.member_list.persistent_and_confirmed(&member) {
+                       !self.server
+                            .member_list
+                            .persistent_and_confirmed(&member) {
                         let rumors = self.server.rumor_list.rumors(member.get_id());
                         if rumors.len() > 0 {
                             let sc = self.server.clone();
 
-                            let guard =
-                                match thread::Builder::new()
-                                    .name(String::from("push-worker"))
-                                    .spawn(move || {
-                                        PushWorker::new(sc).send_rumors(member, rumors);
-                                    }) {
-                                    Ok(guard) => guard,
-                                    Err(e) => {
-                                        error!("Could not spawn thread: {}", e);
-                                        continue;
-                                    }
-                                };
+                            let guard = match thread::Builder::new()
+                                      .name(String::from("push-worker"))
+                                      .spawn(move || {
+                                                 PushWorker::new(sc).send_rumors(member, rumors);
+                                             }) {
+                                Ok(guard) => guard,
+                                Err(e) => {
+                                    error!("Could not spawn thread: {}", e);
+                                    continue;
+                                }
+                            };
                             thread_list.push(guard);
                         }
                     }
                 }
                 let num_threads = thread_list.len();
                 for guard in thread_list.drain(0..num_threads) {
-                    let _ = guard.join().map_err(|e| println!("Push worker died: {:?}", e));
+                    let _ = guard
+                        .join()
+                        .map_err(|e| println!("Push worker died: {:?}", e));
                 }
                 if SteadyTime::now() < next_gossip {
                     let wait_time = (next_gossip - SteadyTime::now()).num_milliseconds();
@@ -151,13 +156,21 @@ impl PushWorker {
             .as_mut()
             .socket(zmq::PUSH)
             .expect("Failure to create the ZMQ push socket");
-        socket.set_linger(1000)
+        socket
+            .set_linger(1000)
             .expect("Failure to set the ZMQ push socket to not linger");
-        socket.set_tcp_keepalive(0)
+        socket
+            .set_tcp_keepalive(0)
             .expect("Failure to set the ZMQ push socket to not use keepalive");
-        socket.set_immediate(true).expect("Failure to set the ZMQ push socket to immediate");
-        socket.set_sndhwm(1000).expect("Failure to set the ZMQ push socket hwm");
-        socket.set_sndtimeo(500).expect("Failure to set the ZMQ send timeout");
+        socket
+            .set_immediate(true)
+            .expect("Failure to set the ZMQ push socket to immediate");
+        socket
+            .set_sndhwm(1000)
+            .expect("Failure to set the ZMQ push socket hwm");
+        socket
+            .set_sndtimeo(500)
+            .expect("Failure to set the ZMQ send timeout");
         let to_addr = format!("{}:{}", member.get_address(), member.get_gossip_port());
         match socket.connect(&format!("tcp://{}", to_addr)) {
             Ok(()) => debug!("Connected push socket to {:?}", member),
@@ -191,8 +204,8 @@ impl PushWorker {
                     //           member.get_id(),
                     //           &send_rumor);
                     match self.server
-                        .service_store
-                        .write_to_bytes(&rumor_key.key, &rumor_key.id) {
+                              .service_store
+                              .write_to_bytes(&rumor_key.key, &rumor_key.id) {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             println!("Could not write our own rumor to bytes; abandoning \
@@ -208,8 +221,8 @@ impl PushWorker {
                     //           member.get_id(),
                     //           &send_rumor);
                     match self.server
-                        .service_config_store
-                        .write_to_bytes(&rumor_key.key, &rumor_key.id) {
+                              .service_config_store
+                              .write_to_bytes(&rumor_key.key, &rumor_key.id) {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             println!("Could not write our own rumor to bytes; abandoning \
@@ -225,8 +238,8 @@ impl PushWorker {
                     //           member.get_id(),
                     //           &send_rumor);
                     match self.server
-                        .service_file_store
-                        .write_to_bytes(&rumor_key.key, &rumor_key.id) {
+                              .service_file_store
+                              .write_to_bytes(&rumor_key.key, &rumor_key.id) {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             println!("Could not write our own rumor to bytes; abandoning \
@@ -242,8 +255,8 @@ impl PushWorker {
                     //           member.get_id(),
                     //           &send_rumor);
                     match self.server
-                        .election_store
-                        .write_to_bytes(&rumor_key.key, &rumor_key.id) {
+                              .election_store
+                              .write_to_bytes(&rumor_key.key, &rumor_key.id) {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             println!("Could not write our own rumor to bytes; abandoning \
@@ -255,8 +268,8 @@ impl PushWorker {
                 }
                 ProtoRumor_Type::ElectionUpdate => {
                     match self.server
-                        .update_store
-                        .write_to_bytes(&rumor_key.key, &rumor_key.id) {
+                              .update_store
+                              .write_to_bytes(&rumor_key.key, &rumor_key.id) {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             println!("Could not write our own rumor to bytes; abandoning sending \
@@ -284,20 +297,27 @@ impl PushWorker {
                 Err(e) => println!("Could not send rumor to {:?}; ZMQ said: {:?}", member, e),
             }
         }
-        self.server.rumor_list.update_heat(member.get_id(), &rumors);
+        self.server
+            .rumor_list
+            .update_heat(member.get_id(), &rumors);
     }
 
     /// Given a rumorkey, creates a protobuf rumor for sharing.
     fn create_member_rumor(&self, rumor_key: &RumorKey) -> ProtoRumor {
         let mut member: ProtoMember = ProtoMember::new();
-        self.server.member_list.with_member(&rumor_key.key(), |m| {
-            // TODO: This should not stand
-            member = m.unwrap().proto.clone();
-        });
+        self.server
+            .member_list
+            .with_member(&rumor_key.key(), |m| {
+                // TODO: This should not stand
+                member = m.unwrap().proto.clone();
+            });
         let mut membership = ProtoMembership::new();
         membership.set_member(member);
-        membership.set_health(
-            self.server.member_list.health_of_by_id(&rumor_key.key()).unwrap().into());
+        membership.set_health(self.server
+                                  .member_list
+                                  .health_of_by_id(&rumor_key.key())
+                                  .unwrap()
+                                  .into());
         let mut rumor = ProtoRumor::new();
         rumor.set_field_type(ProtoRumor_Type::Member);
         rumor.set_member(membership);

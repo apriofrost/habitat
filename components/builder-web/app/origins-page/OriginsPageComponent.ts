@@ -13,14 +13,12 @@
 // limitations under the License.
 
 import {Component, OnInit} from "@angular/core";
-import {RouterLink} from "@angular/router";
 import {acceptOriginInvitation, fetchMyOriginInvitations, fetchMyOrigins}
     from "../actions/index";
 import {AppStore} from "../AppStore";
 import {requireSignIn} from "../util";
 
 @Component({
-    directives: [RouterLink],
     template: `
     <div class="hab-origins">
         <div class="page-title">
@@ -63,7 +61,7 @@ import {requireSignIn} from "../util";
                        <h3 class="hab-item-list--title">{{invitation.origin_name}}</h3>
                        <button
                            class="count"
-                           (click)="acceptInvitation(invitation.id)">
+                           (click)="acceptInvitation(invitation.id, invitation.origin_name)">
                            Accept Invitation
                         </button>
                     </li>
@@ -82,9 +80,10 @@ export class OriginsPageComponent implements OnInit {
 
     get ui() { return this.store.getState().origins.ui.mine; }
 
-    private acceptInvitation(invitationId) {
+    acceptInvitation(invitationId, originName) {
         this.store.dispatch(acceptOriginInvitation(
-            invitationId,
+          invitationId,
+          originName,
             this.store.getState().gitHub.authToken
         ));
     }

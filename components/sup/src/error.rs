@@ -42,7 +42,7 @@ use std::error;
 use std::ffi;
 use std::fmt;
 use std::net;
-use std::num;
+use std::path::PathBuf;
 use std::result;
 use std::str;
 use std::string;
@@ -52,12 +52,13 @@ use ansi_term::Colour::Red;
 use butterfly;
 use common;
 use depot_client;
+use glob;
 use handlebars;
 use hcore::{self, package};
 use hcore::package::Identifiable;
+use notify;
 use toml;
 
-use manager::service::hooks::HookType;
 use output::StructuredOutput;
 use PROGRAM_NAME;
 
@@ -99,9 +100,12 @@ impl SupError {
 /// All the kinds of errors we produce.
 #[derive(Debug)]
 pub enum Error {
+    BadDataFile(PathBuf, io::Error),
+    BadDataPath(PathBuf, io::Error),
+    BadDesiredState(String),
+    BadSpecsPath(PathBuf, io::Error),
+    BadStartStyle(String),
     ButterflyError(butterfly::error::Error),
-    CommandNotImplemented,
-    DbInvalidPath,
     DepotClient(depot_client::Error),
     EnvJoinPathsError(env::JoinPathsError),
     ExecCommandNotFound(String),
@@ -110,37 +114,37 @@ pub enum Error {
     HabitatCore(hcore::Error),
     TemplateFileError(handlebars::TemplateFileError),
     TemplateRenderError(handlebars::RenderError),
-    /// A hook failed to successfully execute. This error contains the type of hook which failed
-    /// to run and the exit code.
-    HookFailed(HookType, i32),
     InvalidBinding(String),
     InvalidKeyParameter(String),
     InvalidPidFile,
-    InvalidPort(num::ParseIntError),
-    InvalidServiceGroupString(String),
+    InvalidTopology(String),
     InvalidUpdateStrategy(String),
     Io(io::Error),
     IPFailed,
-    KeyNotFound(String),
-    MetaFileIO(io::Error),
+    MissingRequiredBind(Vec<String>),
+    MissingRequiredIdent,
     NameLookup(io::Error),
     NetParseError(net::AddrParseError),
-    NoRunFile,
     NulError(ffi::NulError),
-    PackageArchiveMalformed(String),
     PackageNotFound(package::PackageIdent),
     Permissions(String),
-    RemotePackageNotFound(package::PackageIdent),
-    RootRequired,
+    ProcessLockCorrupt,
+    ProcessLocked(u32),
+    ProcessLockIO(PathBuf, io::Error),
+    ServiceLoaded(package::PackageIdent),
+    ServiceSpecFileIO(PathBuf, io::Error),
+    ServiceSpecParse(toml::de::Error),
+    ServiceSpecRender(toml::ser::Error),
     SignalFailed,
-    SignalNotifierStarted,
+    SpecWatcherDirNotFound(String),
+    SpecWatcherGlob(glob::PatternError),
+    SpecWatcherNotify(notify::Error),
     StrFromUtf8Error(str::Utf8Error),
     StringFromUtf8Error(string::FromUtf8Error),
-    TomlEncode(toml::Error),
+    TomlEncode(toml::ser::Error),
     TomlMergeError(String),
-    TomlParser(Vec<toml::ParserError>),
+    TomlParser(toml::de::Error),
     TryRecvError(mpsc::TryRecvError),
-    UnknownTopology(String),
     UnpackFailed,
 }
 
@@ -149,6 +153,25 @@ impl fmt::Display for SupError {
     // verbose on, and print it.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let content = match self.err {
+            Error::BadDataFile(ref path, ref err) => {
+                format!("Unable to read or write to data file, {}, {}",
+                        path.display(),
+                        err)
+            }
+            Error::BadDataPath(ref path, ref err) => {
+                format!("Unable to read or write to data directory, {}, {}",
+                        path.display(),
+                        err)
+            }
+            Error::BadDesiredState(ref state) => {
+                format!("Unknown service desired state style '{}'", state)
+            }
+            Error::BadSpecsPath(ref path, ref err) => {
+                format!("Unable to create the specs directory '{}' ({})",
+                        path.display(),
+                        err)
+            }
+            Error::BadStartStyle(ref style) => format!("Unknown service start style '{}'", style),
             Error::ButterflyError(ref err) => format!("Butterfly error: {}", err),
             Error::ExecCommandNotFound(ref c) => {
                 format!("`{}' was not found on the filesystem or in PATH", c)
@@ -158,43 +181,29 @@ impl fmt::Display for SupError {
             Error::HabitatCore(ref err) => format!("{}", err),
             Error::TemplateFileError(ref err) => format!("{:?}", err),
             Error::TemplateRenderError(ref err) => format!("{}", err),
-            Error::CommandNotImplemented => format!("Command is not yet implemented!"),
-            Error::DbInvalidPath => format!("Invalid filepath to internal datastore"),
             Error::DepotClient(ref err) => format!("{}", err),
             Error::EnvJoinPathsError(ref err) => format!("{}", err),
             Error::FileNotFound(ref e) => format!("File not found at: {}", e),
-            Error::HookFailed(ref hook, ref code) => {
-                format!("{} hook failed to run with exit code {}", hook, code)
-            }
             Error::InvalidBinding(ref binding) => {
-                format!("Invalid binding - must be ':' delimited: {}", binding)
+                format!("Invalid binding \"{}\", must be of the form <NAME>:<SERVICE_GROUP> where \
+                         <NAME> is a service name and <SERVICE_GROUP> is a valid service group",
+                        binding)
             }
             Error::InvalidKeyParameter(ref e) => {
                 format!("Invalid parameter for key generation: {:?}", e)
             }
-            Error::InvalidPort(ref e) => {
-                format!("Invalid port number in package expose metadata: {}", e)
-            }
             Error::InvalidPidFile => format!("Invalid child process PID file"),
-            Error::InvalidServiceGroupString(ref e) => {
-                format!("Invalid service group string: {}", e)
-            }
+            Error::InvalidTopology(ref t) => format!("Invalid topology: {}", t),
             Error::InvalidUpdateStrategy(ref s) => format!("Invalid update strategy: {}", s),
             Error::Io(ref err) => format!("{}", err),
             Error::IPFailed => format!("Failed to discover this hosts outbound IP address"),
-            Error::KeyNotFound(ref e) => format!("Key not found in key cache: {}", e),
-            Error::MetaFileIO(ref e) => format!("IO error while accessing MetaFile: {:?}", e),
+            Error::MissingRequiredBind(ref e) => {
+                format!("Missing required bind(s), {}", e.join(", "))
+            }
+            Error::MissingRequiredIdent => format!("Missing required ident field: (example: ident = \"core/redis\")"),
             Error::NameLookup(ref e) => format!("Error resolving a name or IP address: {}", e),
             Error::NetParseError(ref e) => format!("Can't parse ip:port: {}", e),
-            Error::NoRunFile => {
-                format!("No run file is present for this package; specify a run hook or \
-                         $pkg_svc_run in your plan")
-            }
             Error::NulError(ref e) => format!("{}", e),
-            Error::PackageArchiveMalformed(ref e) => {
-                format!("Package archive was unreadable or contained unexpected contents: {:?}",
-                        e)
-            }
             Error::PackageNotFound(ref pkg) => {
                 if pkg.fully_qualified() {
                     format!("Cannot find package: {}", pkg)
@@ -202,29 +211,47 @@ impl fmt::Display for SupError {
                     format!("Cannot find a release of package: {}", pkg)
                 }
             }
-            Error::RemotePackageNotFound(ref pkg) => {
-                if pkg.fully_qualified() {
-                    format!("Cannot find package in any sources: {}", pkg)
-                } else {
-                    format!("Cannot find a release of package in any sources: {}", pkg)
-                }
+            Error::ProcessLockCorrupt => format!("Unable to decode contents of process lock"),
+            Error::ProcessLocked(ref pid) => {
+                format!("Unable to start Habitat Supervisor because another instance is already \
+                    running with the pid {}. If your intention was to run multiple Supervisors - \
+                    that can be done by setting a value for `--override-name` at startup - but \
+                    it is not recommended.",
+                        pid)
             }
-            Error::RootRequired => {
-                "Root or administrator permissions required to complete operation".to_string()
+            Error::ProcessLockIO(ref path, ref err) => {
+                format!("Unable to start Habitat Supervisor because we weren't able to write or \
+                    read to a process lock at {}, {}",
+                        path.display(),
+                        err)
+            }
+            Error::ServiceLoaded(ref ident) => {
+                format!("Service already loaded, unload '{}' and try again", ident)
+            }
+            Error::ServiceSpecFileIO(ref path, ref err) => {
+                format!("Unable to write or read to a service spec file at {}, {}",
+                        path.display(),
+                        err)
+            }
+            Error::ServiceSpecParse(ref err) => {
+                format!("Unable to parse contents of service spec file, {}", err)
+            }
+            Error::ServiceSpecRender(ref err) => {
+                format!("Service spec could not be rendered successfully: {}", err)
             }
             Error::SignalFailed => format!("Failed to send a signal to the child process"),
-            Error::SignalNotifierStarted => {
-                format!("Only one instance of a Signal Notifier may be running")
+            Error::SpecWatcherDirNotFound(ref path) => {
+                format!("Spec directory '{}' not created or is not a directory",
+                        path)
             }
+            Error::SpecWatcherGlob(ref e) => format!("{}", e),
+            Error::SpecWatcherNotify(ref e) => format!("{}", e),
             Error::StrFromUtf8Error(ref e) => format!("{}", e),
             Error::StringFromUtf8Error(ref e) => format!("{}", e),
-            Error::TomlEncode(ref e) => format!("Failed to encode toml: {}", e),
-            Error::TomlMergeError(ref e) => format!("Failed to merge toml: {}", e),
-            Error::TomlParser(ref errs) => {
-                format!("Failed to parse toml:\n{}", toml_parser_string(errs))
-            }
+            Error::TomlEncode(ref e) => format!("Failed to encode TOML: {}", e),
+            Error::TomlMergeError(ref e) => format!("Failed to merge TOML: {}", e),
+            Error::TomlParser(ref err) => format!("Failed to parse TOML: {}", err),
             Error::TryRecvError(ref err) => format!("{}", err),
-            Error::UnknownTopology(ref t) => format!("Unknown topology {}!", t),
             Error::UnpackFailed => format!("Failed to unpack a package"),
         };
         let cstring = Red.bold().paint(content).to_string();
@@ -243,69 +270,54 @@ impl fmt::Display for SupError {
 impl error::Error for SupError {
     fn description(&self) -> &str {
         match self.err {
+            Error::BadDataFile(_, _) => "Unable to read or write to a data file",
+            Error::BadDataPath(_, _) => "Unable to read or write to data directory",
+            Error::BadDesiredState(_) => "Unknown desired state in service spec",
+            Error::BadSpecsPath(_, _) => "Unable to create the specs directory",
+            Error::BadStartStyle(_) => "Unknown start style in service spec",
             Error::ButterflyError(ref err) => err.description(),
             Error::ExecCommandNotFound(_) => "Exec command was not found on filesystem or in PATH",
             Error::TemplateFileError(ref err) => err.description(),
             Error::TemplateRenderError(ref err) => err.description(),
             Error::HabitatCommon(ref err) => err.description(),
             Error::HabitatCore(ref err) => err.description(),
-            Error::CommandNotImplemented => "Command is not yet implemented!",
-            Error::DbInvalidPath => "A bad filepath was provided for an internal datastore",
             Error::DepotClient(ref err) => err.description(),
             Error::EnvJoinPathsError(ref err) => err.description(),
             Error::FileNotFound(_) => "File not found",
-            Error::HookFailed(_, _) => "Hook failed to run",
             Error::InvalidBinding(_) => "Invalid binding parameter",
             Error::InvalidKeyParameter(_) => "Key parameter error",
-            Error::InvalidPort(_) => "Invalid port number in package expose metadata",
             Error::InvalidPidFile => "Invalid child process PID file",
-            Error::InvalidServiceGroupString(_) => {
-                "Service group strings must be in service.group format (example: redis.default)"
-            }
+            Error::InvalidTopology(_) => "Invalid topology",
             Error::InvalidUpdateStrategy(_) => "Invalid update strategy",
             Error::Io(ref err) => err.description(),
             Error::IPFailed => "Failed to discover the outbound IP address",
-            Error::KeyNotFound(_) => "Key not found in key cache",
-            Error::MetaFileIO(_) => "MetaFile could not be read or written to",
+            Error::MissingRequiredBind(_) => "A service to start without specifying a service group for all required binds",
+            Error::MissingRequiredIdent => "Missing required ident field: (example: ident = \"core/redis\")",
             Error::NetParseError(_) => "Can't parse IP:port",
             Error::NameLookup(_) => "Error resolving a name or IP address",
-            Error::NoRunFile => {
-                "No run file is present for this package; specify a run hook or $pkg_svc_run \
-                 in your plan"
-            }
-            Error::NulError(_) => {
-                "An attempt was made to build a CString with a null byte inside it"
-            }
-            Error::PackageArchiveMalformed(_) => {
-                "Package archive was unreadable or had unexpected contents"
-            }
+            Error::NulError(_) => "An attempt was made to build a CString with a null byte inside it",
             Error::PackageNotFound(_) => "Cannot find a package",
             Error::Permissions(_) => "File system permissions error",
-            Error::RemotePackageNotFound(_) => "Cannot find a package in any sources",
-            Error::RootRequired => {
-                "Root or administrator permissions required to complete operation"
-            }
+            Error::ProcessLockCorrupt => "Unable to decode contents of process lock",
+            Error::ProcessLocked(_) => "Another instance of the Habitat Supervisor is already running",
+            Error::ProcessLockIO(_, _) => "Unable to write or read to a process lock",
+            Error::ServiceLoaded(_) => "Service load or start called when service already loaded",
+            Error::ServiceSpecFileIO(_, _) => "Unable to write or read to a service spec file",
+            Error::ServiceSpecParse(_) => "Service spec could not be parsed successfully",
+            Error::ServiceSpecRender(_) => "Service spec TOML could not be rendered successfully",
             Error::SignalFailed => "Failed to send a signal to the child process",
-            Error::SignalNotifierStarted => "Only one instance of a Signal Notifier may be running",
+            Error::SpecWatcherDirNotFound(_) => "Spec directory not created or is not a directory",
+            Error::SpecWatcherGlob(_) => "Spec watcher file globbing error",
+            Error::SpecWatcherNotify(_) => "Spec watcher error",
             Error::StrFromUtf8Error(_) => "Failed to convert a str from a &[u8] as UTF-8",
             Error::StringFromUtf8Error(_) => "Failed to convert a string from a Vec<u8> as UTF-8",
             Error::TomlEncode(_) => "Failed to encode toml!",
-            Error::TomlMergeError(_) => "Failed to merge toml!",
-            Error::TomlParser(_) => "Failed to parse toml!",
+            Error::TomlMergeError(_) => "Failed to merge TOML!",
+            Error::TomlParser(_) => "Failed to parse TOML!",
             Error::TryRecvError(_) => "A channel failed to receive a response",
-            Error::UnknownTopology(_) => "Unknown topology",
             Error::UnpackFailed => "Failed to unpack a package",
         }
     }
-}
-
-fn toml_parser_string(errs: &Vec<toml::ParserError>) -> String {
-    let mut errors = String::new();
-    for err in errs.iter() {
-        errors.push_str(&format!("{}", err));
-        errors.push_str("\n");
-    }
-    return errors;
 }
 
 impl From<net::AddrParseError> for SupError {
@@ -323,6 +335,12 @@ impl From<butterfly::error::Error> for SupError {
 impl From<common::Error> for SupError {
     fn from(err: common::Error) -> SupError {
         sup_error!(Error::HabitatCommon(err))
+    }
+}
+
+impl From<glob::PatternError> for SupError {
+    fn from(err: glob::PatternError) -> SupError {
+        sup_error!(Error::SpecWatcherGlob(err))
     }
 }
 
@@ -386,8 +404,20 @@ impl From<mpsc::TryRecvError> for SupError {
     }
 }
 
-impl From<toml::Error> for SupError {
-    fn from(err: toml::Error) -> Self {
+impl From<notify::Error> for SupError {
+    fn from(err: notify::Error) -> SupError {
+        sup_error!(Error::SpecWatcherNotify(err))
+    }
+}
+
+impl From<toml::de::Error> for SupError {
+    fn from(err: toml::de::Error) -> Self {
+        sup_error!(Error::TomlParser(err))
+    }
+}
+
+impl From<toml::ser::Error> for SupError {
+    fn from(err: toml::ser::Error) -> Self {
         sup_error!(Error::TomlEncode(err))
     }
 }

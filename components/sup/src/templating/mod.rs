@@ -23,6 +23,7 @@ impl Template {
     pub fn new() -> Self {
         let mut handlebars = Handlebars::new();
         handlebars.register_helper("pkgPathFor", Box::new(helpers::pkg_path_for));
+        handlebars.register_helper("eachAlive", Box::new(helpers::each_alive));
         handlebars.register_helper("toUppercase", Box::new(helpers::to_uppercase));
         handlebars.register_helper("toLowercase", Box::new(helpers::to_lowercase));
         handlebars.register_helper("strReplace", Box::new(helpers::str_replace));
@@ -59,8 +60,18 @@ fn never_escape(data: &str) -> String {
 
 #[cfg(test)]
 mod test {
+    use toml;
+    use serde_json;
+
+    use std::fs::File;
+    use std::io::Read;
+    use std::path::PathBuf;
     use std::collections::BTreeMap;
+
     use super::*;
+
+    use util::convert;
+    use manager::ServiceConfig;
 
     #[test]
     fn test_handlebars_json_helper() {
@@ -80,7 +91,7 @@ mod test {
                    r#"{
   "test": "something"
 }"#
-                       .to_string());
+                           .to_string());
     }
 
     #[test]
@@ -100,7 +111,7 @@ mod test {
         assert_eq!(r.ok().unwrap(),
                    r#"test = "something"
 "#
-                       .to_string());
+                           .to_string());
     }
 
     #[test]
@@ -139,5 +150,121 @@ mod test {
         m.insert("new".into(), "new".into());
         let rendered = template.render("t", &m).unwrap();
         assert_eq!(rendered, "this is new".to_string());
+    }
+
+    pub fn root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
+    }
+
+    pub fn fixtures() -> PathBuf {
+        root().join("fixtures")
+    }
+
+    pub fn templates() -> PathBuf {
+        fixtures().join("templates")
+    }
+
+    pub fn sample_configs() -> PathBuf {
+        fixtures().join("sample_configs")
+    }
+
+
+    pub fn service_config_json_from_toml_file(filename: &str) -> serde_json::Value {
+        let mut file = File::open(sample_configs().join(filename)).unwrap();
+        let mut config = String::new();
+        let _ = file.read_to_string(&mut config).unwrap();
+        let toml = toml::de::from_str(&config).unwrap();
+        let data = convert::toml_to_json(toml::Value::Table(toml));
+        data
+    }
+
+    #[test]
+    fn pkg_path_for_helper() {
+        let content = "{{pkgPathFor \"core/acl\"}}".to_string();
+        let mut template = Template::new();
+        template.register_template_string("t", content).unwrap();
+
+        let data = service_config_json_from_toml_file("complex_config.toml");
+        let rendered = template.render("t", &data).unwrap();
+        assert_eq!(PathBuf::from(rendered),
+                   PathBuf::from("/hab/pkgs/core/acl/2.2.52/20161208223311"));
+    }
+
+    #[test]
+    fn deserialize_simple_config_toml() {
+        let data = service_config_json_from_toml_file("simple_config.toml");
+        let cfg = serde_json::from_value::<ServiceConfig>(data).unwrap();
+        assert_eq!(cfg.pkg.name, "testplan");
+    }
+
+    #[test]
+    fn deserialize_complex_config_toml() {
+        let data = service_config_json_from_toml_file("complex_config.toml");
+        let cfg = serde_json::from_value::<ServiceConfig>(data).unwrap();
+        assert_eq!(cfg.pkg.name, "lsyncd");
+    }
+
+    #[test]
+    fn each_alive_helper_content() {
+        let mut template = Template::new();
+        // template using the new `eachAlive` helper
+        template
+            .register_template_file("each_alive", templates().join("each_alive.txt"))
+            .unwrap();
+
+        // template using an each block with a nested if block filtering on `alive`
+        template
+            .register_template_file("all_members", templates().join("all_members.txt"))
+            .unwrap();
+
+        let data = service_config_json_from_toml_file("multiple_supervisors_config.toml");
+
+        let each_alive_render = template.render("each_alive", &data).unwrap();
+        let each_if_render = template.render("all_members", &data).unwrap();
+
+        assert_eq!(each_alive_render, each_if_render);
+    }
+
+    #[test]
+    fn each_alive_helper_first_node() {
+        let mut template = Template::new();
+        // template using the new `eachAlive` helper
+        template
+            .register_template_file("each_alive", templates().join("each_alive.txt"))
+            .unwrap();
+
+        // template using an each block with a nested if block filtering on `alive`
+        template
+            .register_template_file("all_members", templates().join("all_members.txt"))
+            .unwrap();
+
+        let data = service_config_json_from_toml_file("one_supervisor_not_started.toml");
+
+        let each_alive_render = template.render("each_alive", &data).unwrap();
+        let each_if_render = template.render("all_members", &data).unwrap();
+
+        assert_eq!(each_alive_render, each_if_render);
+    }
+
+    #[test]
+    fn each_alive_helper_with_identifier_alias() {
+        let mut template = Template::new();
+        // template using the new `eachAlive` helper
+        template
+            .register_template_file("each_alive",
+                                    templates().join("each_alive_with_identifier.txt"))
+            .unwrap();
+
+        // template using an each block with a nested if block filtering on `alive`
+        template
+            .register_template_file("all_members", templates().join("all_members.txt"))
+            .unwrap();
+
+        let data = service_config_json_from_toml_file("multiple_supervisors_config.toml");
+
+        let each_alive_render = template.render("each_alive", &data).unwrap();
+        let each_if_render = template.render("all_members", &data).unwrap();
+
+        assert_eq!(each_alive_render, each_if_render);
     }
 }

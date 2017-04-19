@@ -12,36 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::TypeId;
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write, BufWriter};
 use std::path::PathBuf;
+use std::io::{Read, Write, BufWriter};
 use std::result;
 use std::str::FromStr;
 
+use uuid::Uuid;
 use bodyparser;
-use dbcache::{self, BasicSet};
 use hab_core::package::{Identifiable, FromArchive, PackageArchive, PackageTarget};
 use hab_core::crypto::keys::{self, PairType};
 use hab_core::crypto::SigKeyPair;
 use hab_core::event::*;
-use bld_core::metrics::*;
 use hab_net::config::RouteAddrs;
 use hab_net::http::controller::*;
 use hab_net::privilege;
-use hab_net::routing::{Broker, BrokerConn};
+use hab_net::routing::{Broker, RouteResult};
 use hab_net::server::NetIdent;
+use hyper::header::{Charset, ContentDisposition, DispositionType, DispositionParam};
 use hyper::mime::{Mime, TopLevel, SubLevel, Attr, Value};
-use iron::headers::{ContentType, UserAgent, HeaderFormat};
+use iron::{status, headers, typemap};
+use iron::headers::{ContentType, UserAgent};
+use iron::middleware::BeforeMiddleware;
 use iron::prelude::*;
-use iron::{status, headers};
 use iron::request::Body;
-use iron::typemap;
+use iron::typemap::Key;
 use mount::Mount;
 use persistent;
-use protocol::depotsrv;
-use protocol::net::ErrCode;
+use protobuf::{self, parse_from_bytes};
+use protocol::net::{NetOk, ErrCode, NetError};
+use protocol::originsrv::*;
+use protocol::Routable;
+use protocol::scheduler::{Group, GroupCreate, GroupGet};
 use protocol::sessionsrv::{Account, AccountGet};
-use protocol::vault::*;
 use regex::Regex;
 use router::{Params, Router};
 use serde::Serialize;
@@ -49,11 +54,67 @@ use serde_json;
 use url;
 use urlencoded::UrlEncodedQuery;
 
-use super::Depot;
+use super::DepotUtil;
 use config::Config;
 use error::{Error, Result};
 
 define_event_log!();
+
+#[derive(Default)]
+pub struct TestableBroker {
+    message_map: HashMap<TypeId, Vec<u8>>,
+    error_map: HashMap<TypeId, NetError>,
+    cached_messages: HashMap<TypeId, Vec<u8>>,
+}
+
+impl TestableBroker {
+    pub fn setup<M: Routable, R: protobuf::MessageStatic>(&mut self, response: &R) {
+        let bytes = response.write_to_bytes().unwrap();
+        self.message_map.insert(TypeId::of::<M>(), bytes);
+    }
+
+    pub fn setup_error<M: Routable>(&mut self, error: NetError) {
+        self.error_map.insert(TypeId::of::<M>(), error);
+    }
+
+    pub fn routed_messages(&self) -> RoutedMessages {
+        RoutedMessages(self.cached_messages.clone())
+    }
+
+    pub fn route<M: Routable, R: protobuf::MessageStatic>(&mut self, msg: &M) -> RouteResult<R> {
+        let bytes = msg.write_to_bytes().unwrap();
+        self.cached_messages.insert(TypeId::of::<M>(), bytes);
+        let msg_type = &TypeId::of::<M>();
+        match self.message_map.get(msg_type) {
+            Some(message) => Ok(parse_from_bytes::<R>(message).unwrap()),
+            None => {
+                match self.error_map.get(msg_type) {
+                    Some(error) => Err(error.clone()),
+                    None => panic!("Unable to find message of given type"),
+                }
+            }
+        }
+    }
+}
+
+impl Key for TestableBroker {
+    type Value = Self;
+}
+
+pub struct RoutedMessages(HashMap<TypeId, Vec<u8>>);
+
+impl RoutedMessages {
+    pub fn get<M: Routable>(&self) -> Result<M> {
+        let msg_type = &TypeId::of::<M>();
+        match self.0.get(msg_type) {
+            Some(msg) => {
+                Ok(parse_from_bytes::<M>(msg).expect(&format!("Unable to parse {:?} message",
+                                                              msg_type)))
+            }
+            None => Err(Error::MessageTypeNotFound),
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct OriginCreateReq {
@@ -71,6 +132,16 @@ struct PackageResults<'a, T: 'a> {
 const PAGINATION_RANGE_DEFAULT: isize = 0;
 const PAGINATION_RANGE_MAX: isize = 50;
 const ONE_YEAR_IN_SECS: usize = 31536000;
+
+fn route_message<M: Routable, R: protobuf::MessageStatic>(req: &mut Request,
+                                                          msg: &M)
+                                                          -> RouteResult<R> {
+    if let Some(broker) = req.extensions.get_mut::<TestableBroker>() {
+        return broker.route::<M, R>(msg);
+    }
+
+    Broker::connect().unwrap().route::<M, R>(msg)
+}
 
 fn package_results_json<T: Serialize>(packages: &Vec<T>,
                                       count: isize,
@@ -130,10 +201,10 @@ pub fn origin_show(req: &mut Request) -> IronResult<Response> {
     }
 }
 
-pub fn get_origin(conn: &mut BrokerConn, origin: &str) -> IronResult<Option<Origin>> {
+pub fn get_origin<T: ToString>(req: &mut Request, origin: T) -> IronResult<Option<Origin>> {
     let mut request = OriginGet::new();
     request.set_name(origin.to_string());
-    match conn.route::<OriginGet, Origin>(&request) {
+    match route_message::<OriginGet, Origin>(req, &request) {
         Ok(origin) => Ok(Some(origin)),
         Err(err) => {
             if err.get_code() == ErrCode::ENTITY_NOT_FOUND {
@@ -147,19 +218,66 @@ pub fn get_origin(conn: &mut BrokerConn, origin: &str) -> IronResult<Option<Orig
     }
 }
 
-pub fn check_origin_access<T: ToString>(conn: &mut BrokerConn,
+pub fn check_origin_access<T: ToString>(req: &mut Request,
                                         account_id: u64,
                                         origin: T)
                                         -> IronResult<bool> {
     let mut request = CheckOriginAccessRequest::new();
     request.set_account_id(account_id);
     request.set_origin_name(origin.to_string());
-    match conn.route::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&request) {
+    match route_message::<CheckOriginAccessRequest, CheckOriginAccessResponse>(req, &request) {
         Ok(response) => Ok(response.get_has_access()),
         Err(err) => {
             let body = serde_json::to_string(&err).unwrap();
             let status = net_err_to_http(err.get_code());
             Err(IronError::new(err, (body, status)))
+        }
+    }
+}
+
+pub fn accept_invitation(req: &mut Request) -> IronResult<Response> {
+    // TODO: SA - Eliminate need to clone the session and params
+    let session = req.extensions.get::<Authenticated>().unwrap().clone();
+    let params = req.extensions.get::<Router>().unwrap().clone();
+    let origin = match params.find("origin") {
+        Some(origin) => origin,
+        None => return Ok(Response::with(status::BadRequest)),
+    };
+    let invitation = match params.find("invitation_id") {
+        Some(invitation) => invitation,
+        None => return Ok(Response::with(status::BadRequest)),
+    };
+    let invitation_id = match invitation.parse::<u64>() {
+        Ok(invitation_id) => invitation_id,
+        Err(e) => {
+            error!("Bad request; invitation ID did not parse into a u64, {}", e);
+            return Ok(Response::with(status::BadRequest));
+        }
+    };
+
+    let mut conn = Broker::connect().unwrap();
+    debug!("Accepting invitation for user {} origin {}",
+           &session.get_id(),
+           &origin);
+
+    let mut request = OriginInvitationAcceptRequest::new();
+    request.set_account_id(session.get_id());
+    request.set_invite_id(invitation_id);
+    request.set_origin_name(origin.to_string());
+    request.set_ignore(false);
+
+    match conn.route::<OriginInvitationAcceptRequest, NetOk>(&request) {
+        Ok(_) => {
+            log_event!(req,
+                       Event::OriginInvitationAccept {
+                           id: request.get_invite_id().to_string(),
+                           account: session.get_id().to_string(),
+                       });
+            Ok(Response::with(status::NoContent))
+        }
+        Err(err) => {
+            error!("Error accepting invitation, {}", err);
+            Ok(render_net_error(&err))
         }
     }
 }
@@ -180,7 +298,7 @@ pub fn invite_to_origin(req: &mut Request) -> IronResult<Response> {
     debug!("Creating invitation for user {} origin {}",
            &user_to_invite,
            &origin);
-    if !try!(check_origin_access(&mut conn, session.get_id(), &origin)) {
+    if !try!(check_origin_access(req, session.get_id(), &origin)) {
         return Ok(Response::with(status::Forbidden));
     }
     let mut request = AccountGet::new();
@@ -194,7 +312,7 @@ pub fn invite_to_origin(req: &mut Request) -> IronResult<Response> {
         }
         Err(err) => return Ok(render_net_error(&err)),
     };
-    match try!(get_origin(&mut conn, &origin)) {
+    match try!(get_origin(req, &origin)) {
         Some(mut origin) => {
             invite_request.set_origin_id(origin.get_id());
             invite_request.set_origin_name(origin.take_name());
@@ -203,7 +321,7 @@ pub fn invite_to_origin(req: &mut Request) -> IronResult<Response> {
     };
     invite_request.set_owner_id(session.get_id());
 
-    // store invitations in the vault
+    // store invitations in the originsrv
     match conn.route::<OriginInvitationCreate, OriginInvitation>(&invite_request) {
         Ok(invitation) => {
             log_event!(req,
@@ -220,20 +338,25 @@ pub fn invite_to_origin(req: &mut Request) -> IronResult<Response> {
 }
 
 pub fn list_origin_invitations(req: &mut Request) -> IronResult<Response> {
-    let session = req.extensions.get::<Authenticated>().unwrap();
-    let params = req.extensions.get::<Router>().unwrap();
-    let origin_name = match params.find("origin") {
-        Some(origin) => origin,
-        None => return Ok(Response::with(status::BadRequest)),
-    };
+    let session_id: u64;
+    let origin_name: String;
+    {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        session_id = session.get_id();
+        let params = req.extensions.get::<Router>().unwrap();
+        origin_name = match params.find("origin") {
+            Some(origin) => origin.to_string(),
+            None => return Ok(Response::with(status::BadRequest)),
+        };
+    }
 
     let mut conn = Broker::connect().unwrap();
-    if !try!(check_origin_access(&mut conn, session.get_id(), &origin_name)) {
+    if !try!(check_origin_access(req, session_id, &origin_name)) {
         return Ok(Response::with(status::Forbidden));
     }
 
     let mut request = OriginInvitationListRequest::new();
-    match try!(get_origin(&mut conn, origin_name)) {
+    match try!(get_origin(req, origin_name.as_str())) {
         Some(origin) => request.set_origin_id(origin.get_id()),
         None => return Ok(Response::with(status::NotFound)),
     };
@@ -249,20 +372,26 @@ pub fn list_origin_invitations(req: &mut Request) -> IronResult<Response> {
 }
 
 pub fn list_origin_members(req: &mut Request) -> IronResult<Response> {
-    let session = req.extensions.get::<Authenticated>().unwrap();
-    let params = req.extensions.get::<Router>().unwrap();
-    let origin_name = match params.find("origin") {
-        Some(origin) => origin,
-        None => return Ok(Response::with(status::BadRequest)),
-    };
+    let session_id: u64;
+    let origin_name: String;
+    {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        session_id = session.get_id();
+        let params = req.extensions.get::<Router>().unwrap();
+        origin_name = match params.find("origin") {
+            Some(origin) => origin.to_string(),
+            None => return Ok(Response::with(status::BadRequest)),
+        };
+    }
+
     let mut conn = Broker::connect().unwrap();
 
-    if !try!(check_origin_access(&mut conn, session.get_id(), &origin_name)) {
+    if !try!(check_origin_access(req, session_id, &origin_name)) {
         return Ok(Response::with(status::Forbidden));
     }
 
     let mut request = OriginMemberListRequest::new();
-    match try!(get_origin(&mut conn, origin_name)) {
+    match try!(get_origin(req, origin_name.as_str())) {
         Some(origin) => request.set_origin_id(origin.get_id()),
         None => return Ok(Response::with(status::NotFound)),
     };
@@ -276,24 +405,9 @@ pub fn list_origin_members(req: &mut Request) -> IronResult<Response> {
     }
 }
 
-fn write_string_to_file(filename: &PathBuf, body: String) -> Result<bool> {
-    let path = filename.parent().unwrap();
-    try!(fs::create_dir_all(path));
-    let tempfile = format!("{}.tmp", filename.to_string_lossy());
-    let f = try!(File::create(&tempfile));
-    let mut writer = BufWriter::new(&f);
-    try!(writer.write_all(body.as_bytes()));
-    info!("File added to Depot at {}", filename.to_string_lossy());
-    try!(fs::rename(&tempfile, &filename));
-    Ok(true)
-}
-
-fn write_file(filename: &PathBuf, body: &mut Body) -> Result<bool> {
-    let path = filename.parent().unwrap();
-    try!(fs::create_dir_all(path));
-    let tempfile = format!("{}.tmp", filename.to_string_lossy());
-    let f = try!(File::create(&tempfile));
-    let mut writer = BufWriter::new(&f);
+fn write_archive(filename: &PathBuf, body: &mut Body) -> Result<PackageArchive> {
+    let file = try!(File::create(&filename));
+    let mut writer = BufWriter::new(file);
     let mut written: i64 = 0;
     let mut buf = [0u8; 100000]; // Our byte buffer
     loop {
@@ -313,83 +427,100 @@ fn write_file(filename: &PathBuf, body: &mut Body) -> Result<bool> {
             }
         };
     }
-    info!("File added to Depot at {}", filename.to_string_lossy());
-    try!(fs::rename(&tempfile, &filename));
-    Ok(true)
-}
-
-fn remove_file(filename: &PathBuf) -> Result<bool> {
-    info!("File removed from the Depot from {}",
-          filename.to_string_lossy());
-    try!{fs::remove_file(filename)};
-    Ok(true)
+    Ok(PackageArchive::new(filename))
 }
 
 fn upload_origin_key(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
+    debug!("Upload Origin Public Key {:?}", req);
     // TODO: SA - Eliminate need to clone the session and params
-    let params = req.extensions.get::<Router>().unwrap().clone();
-    let origin = params.find("origin").unwrap();
-    let revision = params.find("revision").unwrap();
     let session = req.extensions.get::<Authenticated>().unwrap().clone();
+    let params = req.extensions.get::<Router>().unwrap().clone();
+    let mut conn = Broker::connect().unwrap();
+    let mut request = OriginPublicKeyCreate::new();
+    request.set_owner_id(session.get_id());
 
-    if !depot.config.insecure {
-        let mut conn = Broker::connect().unwrap();
-        if !try!(check_origin_access(&mut conn, session.get_id(), origin)) {
-            return Ok(Response::with(status::Forbidden));
+    let origin = match params.find("origin") {
+        Some(origin) => {
+            if !try!(check_origin_access(req, session.get_id(), origin)) {
+                return Ok(Response::with(status::Forbidden));
+            }
+            match get_origin(req, origin)? {
+                Some(mut origin) => {
+                    request.set_name(origin.take_name());
+                    request.set_origin_id(origin.get_id());
+                }
+                None => return Ok(Response::with(status::NotFound)),
+            }
+            origin
         }
+        None => return Ok(Response::with(status::BadRequest)),
+    };
+    match params.find("revision") {
+        Some(revision) => request.set_revision(revision.to_string()),
+        None => return Ok(Response::with(status::BadRequest)),
+    };
+
+    let mut key_content = Vec::new();
+    if let Err(e) = req.body.read_to_end(&mut key_content) {
+        debug!("Can't read key content {}", e);
+        return Ok(Response::with(status::BadRequest));
     }
 
-    let mut content = String::new();
-    if let Err(e) = req.body.read_to_string(&mut content) {
-        debug!("Can't read public key upload content: {}", e);
-        return Ok(Response::with(status::NotAcceptable));
-    }
-
-    match SigKeyPair::parse_key_str(&content) {
-        Ok((PairType::Public, _, _)) => (),
-        Ok(_) => {
-            return Ok(Response::with((status::NotAcceptable,
-                                      format!("Received a secret key instead of a public key"))));
+    match String::from_utf8(key_content.clone()) {
+        Ok(content) => {
+            match SigKeyPair::parse_key_str(&content) {
+                Ok((PairType::Public, _, _)) => {
+                    debug!("Received a valid public key");
+                }
+                Ok(_) => {
+                    debug!("Received a secret key instead of a public key");
+                    return Ok(Response::with(status::BadRequest));
+                }
+                Err(e) => {
+                    debug!("Invalid public key content: {}", e);
+                    return Ok(Response::with(status::BadRequest));
+                }
+            }
         }
         Err(e) => {
-            return Ok(Response::with((status::NotAcceptable,
-                                      format!("Invalid public key content: {}", e))));
+            debug!("Can't parse public key upload content: {}", e);
+            return Ok(Response::with(status::BadRequest));
         }
     }
 
-    let origin_keyfile = depot.key_path(origin, revision);
-    // TODO: We can't just check if the keyfile exists on disk since this operation also requires
-    // an entry in the database. This operation should instead check the database since that is
-    // the last step of writing an origin key and represents the success.
-    if origin_keyfile.is_file() {
-        return Ok(Response::with(status::Conflict));
+    request.set_body(key_content);
+    request.set_owner_id(0);
+
+    match conn.route::<OriginPublicKeyCreate, OriginPublicKey>(&request) {
+        Ok(_) => {
+            log_event!(req,
+                       Event::OriginKeyUpload {
+                           origin: origin.to_string(),
+                           version: request.get_revision().to_string(),
+                           account: session.get_id().to_string(),
+                       });
+            let mut response =
+                Response::with((status::Created,
+                                format!("/origins/{}/keys/{}", &origin, &request.get_revision())));
+            let mut base_url: url::Url = req.url.clone().into();
+            base_url.set_path(&format!("key/{}-{}", &origin, &request.get_revision()));
+            response
+                .headers
+                .set(headers::Location(format!("{}", base_url)));
+            Ok(response)
+        }
+        Err(err) => Ok(render_net_error(&err)),
     }
-    debug!("Writing key file {}", origin_keyfile.to_string_lossy());
-    try!(write_string_to_file(&origin_keyfile, content));
-    try!(depot.datastore.origin_keys.write(&origin, &revision));
-
-    log_event!(req,
-               Event::OriginKeyUpload {
-                   origin: origin.to_string(),
-                   version: revision.to_string(),
-                   account: session.get_id().to_string(),
-               });
-
-    let mut response = Response::with((status::Created,
-                                       format!("/origins/{}/keys/{}", &origin, &revision)));
-    let mut base_url: url::Url = req.url.clone().into();
-    base_url.set_path(&format!("key/{}-{}", &origin, &revision));
-    response.headers.set(headers::Location(format!("{}", base_url)));
-    Ok(response)
 }
 
 fn download_latest_origin_secret_key(req: &mut Request) -> IronResult<Response> {
-    let params = req.extensions.get::<Router>().unwrap();
+    let origin = {
+        let params = req.extensions.get::<Router>().unwrap();
+        params.find("origin").unwrap().to_owned()
+    };
     let mut conn = Broker::connect().unwrap();
     let mut request = OriginSecretKeyGet::new();
-    let origin = params.find("origin").unwrap();
-    match try!(get_origin(&mut conn, origin)) {
+    match try!(get_origin(req, origin)) {
         Some(mut origin) => {
             request.set_owner_id(origin.get_owner_id());
             request.set_origin(origin.take_name());
@@ -413,10 +544,10 @@ fn upload_origin_secret_key(req: &mut Request) -> IronResult<Response> {
 
     let origin = match params.find("origin") {
         Some(origin) => {
-            if !try!(check_origin_access(&mut conn, session.get_id(), origin)) {
+            if !try!(check_origin_access(req, session.get_id(), origin)) {
                 return Ok(Response::with(status::Forbidden));
             }
-            match try!(get_origin(&mut conn, origin)) {
+            match try!(get_origin(req, origin)) {
                 Some(mut origin) => {
                     request.set_name(origin.take_name());
                     request.set_origin_id(origin.get_id());
@@ -478,7 +609,9 @@ fn upload_origin_secret_key(req: &mut Request) -> IronResult<Response> {
 }
 
 fn upload_package(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
+    let lock = req.get::<persistent::State<DepotUtil>>()
+        .expect("depot not found");
+    let depot = lock.read().expect("depot read lock is poisoned");
     let checksum_from_param = match extract_query_value("checksum", req) {
         Some(checksum) => checksum,
         None => return Ok(Response::with(status::BadRequest)),
@@ -493,8 +626,6 @@ fn upload_package(req: &mut Request) -> IronResult<Response> {
         return Ok(Response::with(status::BadRequest));
     }
 
-    let mut conn = Broker::connect().unwrap();
-
     debug!("UPLOADING checksum={}, ident={}",
            checksum_from_param,
            ident);
@@ -502,7 +633,7 @@ fn upload_package(req: &mut Request) -> IronResult<Response> {
     // TODO: SA - Eliminate need to clone the session
     let session = req.extensions.get::<Authenticated>().unwrap().clone();
     if !depot.config.insecure {
-        if !try!(check_origin_access(&mut conn, session.get_id(), &ident.get_origin())) {
+        if !try!(check_origin_access(req, session.get_id(), &ident.get_origin())) {
             return Ok(Response::with(status::Forbidden));
         }
         if !ident.fully_qualified() {
@@ -510,39 +641,61 @@ fn upload_package(req: &mut Request) -> IronResult<Response> {
         }
     }
 
-    match depot.datastore.packages.find(&ident) {
-        Ok(_) |
-        Err(dbcache::Error::EntityNotFound) => {
-            if let Some(_) = depot.archive(&ident) {
-                return Ok(Response::with((status::Conflict)));
-            }
-        }
+    // Find the path to folder where archive should be created, and
+    // create the folder if necessary
+    let parent_path = depot.archive_parent(&ident);
+
+    match fs::create_dir_all(parent_path.clone()) {
+        Ok(_) => {}
         Err(e) => {
-            error!("upload_package:1, err={:?}", e);
+            error!("Unable to create archive directory, err={:?}", e);
             return Ok(Response::with(status::InternalServerError));
         }
-    }
+    };
 
-    let filename = depot.archive_path(&ident);
-    try!(write_file(&filename, &mut req.body));
-    let mut archive = PackageArchive::new(filename);
+    // Create a temp file at the archive location
+    let temp_name = format!("{}.tmp", Uuid::new_v4());
+    let temp_path = parent_path.join(temp_name);
+
+    let mut archive = try!(write_archive(&temp_path, &mut req.body));
     debug!("Package Archive: {:#?}", archive);
 
     let target_from_artifact = match archive.target() {
         Ok(target) => target,
         Err(e) => {
             info!("Could not read the target for {:#?}: {:#?}", archive, e);
-            remove_file(&archive.path).expect("Unable to remove temp file");
             return Ok(Response::with(status::UnprocessableEntity));
         }
     };
 
-    if depot.config.supported_target != target_from_artifact {
+    if !depot
+            .config
+            .supported_targets
+            .contains(&target_from_artifact) {
         debug!("Unsupported package platform or architecture {}.",
                target_from_artifact);
-        remove_file(&archive.path).expect("Unable to remove temp file");
         return Ok(Response::with(status::NotImplemented));
     };
+
+    let mut ident_req = OriginPackageGet::new();
+    ident_req.set_ident(ident.clone());
+
+    match route_message::<OriginPackageGet, OriginPackage>(req, &ident_req) {
+        Ok(_) => return Ok(Response::with((status::Conflict))),
+        Err(err) => {
+            match err.get_code() {
+                ErrCode::ENTITY_NOT_FOUND => {
+                    if depot.archive(&ident, &target_from_artifact).is_some() {
+                        return Ok(Response::with((status::Conflict)));
+                    }
+                }
+                _ => {
+                    error!("upload_package:1, err={:?}", err);
+                    return Ok(Response::with(status::InternalServerError));
+                }
+            }
+        }
+    }
 
     let checksum_from_artifact = match archive.checksum() {
         Ok(cksum) => cksum,
@@ -557,15 +710,41 @@ fn upload_package(req: &mut Request) -> IronResult<Response> {
               checksum_from_artifact);
         return Ok(Response::with(status::UnprocessableEntity));
     }
-    let object = match depotsrv::Package::from_archive(&mut archive) {
-        Ok(object) => object,
+
+    let filename = depot.archive_path(&ident, &target_from_artifact);
+
+    match fs::rename(&temp_path, &filename) {
+        Ok(_) => {}
+        Err(e) => {
+            error!("Unable to rename temp archive {:?} to {:?}, err={:?}",
+                   temp_path,
+                   filename,
+                   e);
+            return Ok(Response::with(status::InternalServerError));
+        }
+    }
+
+    info!("File added to Depot at {}", filename.to_string_lossy());
+    let mut archive = PackageArchive::new(filename);
+    let mut package = match OriginPackageCreate::from_archive(&mut archive) {
+        Ok(package) => package,
         Err(e) => {
             info!("Error building package from archive: {:#?}", e);
             return Ok(Response::with(status::UnprocessableEntity));
         }
     };
-    if ident.satisfies(object.get_ident()) {
-        depot.datastore.packages.write(&object).unwrap();
+    if ident.satisfies(package.get_ident()) {
+        package.set_owner_id(session.get_id());
+
+        // let's make sure this origin actually exists
+        match try!(get_origin(req, &ident.get_origin())) {
+            Some(origin) => {
+                package.set_origin_id(origin.get_id());
+            }
+            None => return Ok(Response::with(status::NotFound)),
+        };
+
+        route_message::<OriginPackageCreate, OriginPackage>(req, &package).unwrap();
 
         log_event!(req,
                    Event::PackageUpload {
@@ -573,115 +752,203 @@ fn upload_package(req: &mut Request) -> IronResult<Response> {
                        package: ident.get_name().to_string(),
                        version: ident.get_version().to_string(),
                        release: ident.get_release().to_string(),
+                       target: target_from_artifact.to_string(),
                        account: session.get_id().to_string(),
                    });
 
+        // Schedule re-build of dependent packages (if requested)
+        // Don't schedule builds if the upload is being done by the builder
+        // Currently, we only do dep builds of 'core' packages
+        if depot.config.builds_enabled && ident.get_origin() == "core" &&
+           !match extract_query_value("builder", req) {
+                Some(_) => true,
+                None => false,
+            } {
+            let mut conn = Broker::connect().unwrap();
+
+            let mut request = GroupCreate::new();
+            request.set_origin(ident.get_origin().to_string());
+            request.set_package(ident.get_name().to_string());
+            request.set_deps_only(true);
+
+            match conn.route::<GroupCreate, Group>(&request) {
+                Ok(group) => {
+                    debug!("Scheduled reverse dependecy build, group id: {}",
+                           group.get_id())
+                }
+                Err(err) => error!("Unable to schedule build, err: {:?}", err),
+            }
+        }
+
         let mut response = Response::with((status::Created,
-                                           format!("/pkgs/{}/download", object.get_ident())));
+                                           format!("/pkgs/{}/download", package.get_ident())));
         let mut base_url: url::Url = req.url.clone().into();
-        base_url.set_path(&format!("pkgs/{}/download", object.get_ident()));
-        response.headers.set(headers::Location(format!("{}", base_url)));
+        base_url.set_path(&format!("pkgs/{}/download", package.get_ident()));
+        response
+            .headers
+            .set(headers::Location(format!("{}", base_url)));
         Ok(response)
     } else {
         info!("Ident mismatch, expected={:?}, got={:?}",
               ident,
-              object.get_ident());
+              package.get_ident());
         Ok(Response::with(status::UnprocessableEntity))
     }
 }
 
-fn download_origin_key(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
-    let params = req.extensions.get::<Router>().unwrap();
+fn schedule(req: &mut Request) -> IronResult<Response> {
+    let params = req.extensions.get::<Router>().unwrap().clone();
     let origin = match params.find("origin") {
         Some(origin) => origin,
         None => return Ok(Response::with(status::BadRequest)),
     };
-    let revision = match params.find("revision") {
-        Some(revision) => revision,
+    let package = match params.find("pkg") {
+        Some(pkg) => pkg,
         None => return Ok(Response::with(status::BadRequest)),
     };
-    debug!("Trying to retrieve origin key {}-{}", &origin, &revision);
-    let origin_keyfile = depot.key_path(&origin, &revision);
-    debug!("Looking for {}", &origin_keyfile.to_string_lossy());
-    match origin_keyfile.metadata() {
-        Ok(md) => {
-            if !md.is_file() {
-                return Ok(Response::with(status::NotFound));
-            };
+
+    let mut conn = Broker::connect().unwrap();
+
+    let mut request = GroupCreate::new();
+    request.set_origin(String::from(origin));
+    request.set_package(String::from(package));
+
+    match conn.route::<GroupCreate, Group>(&request) {
+        Ok(group) => {
+            let mut response = render_json(status::Ok, &group);
+            dont_cache_response(&mut response);
+            Ok(response)
         }
-        Err(e) => {
-            println!("Can't read key file {}: {}",
-                     &origin_keyfile.to_string_lossy(),
-                     e);
+        Err(err) => Ok(render_net_error(&err)),
+    }
+}
+
+fn get_schedule(req: &mut Request) -> IronResult<Response> {
+    let group_id = {
+        let params = req.extensions.get::<Router>().unwrap();
+        let group_id_str = match params.find("groupid") {
+            Some(s) => s,
+            None => return Ok(Response::with(status::BadRequest)),
+        };
+
+        match group_id_str.parse::<u64>() {
+            Ok(id) => id,
+            Err(_) => return Ok(Response::with(status::BadRequest)),
+        }
+    };
+
+    let mut conn = Broker::connect().unwrap();
+
+    let mut request = GroupGet::new();
+    request.set_group_id(group_id);
+
+    match conn.route::<GroupGet, Group>(&request) {
+        Ok(group) => {
+            let mut response = render_json(status::Ok, &group);
+            dont_cache_response(&mut response);
+            Ok(response)
+        }
+        Err(err) => Ok(render_net_error(&err)),
+    }
+}
+
+fn download_origin_key(req: &mut Request) -> IronResult<Response> {
+    let params = req.extensions.get::<Router>().unwrap();
+    // TODO: SA - Eliminate need to clone the session and params
+    let session = req.extensions.get::<Authenticated>().unwrap().clone();
+    let mut conn = Broker::connect().unwrap();
+    let mut request = OriginPublicKeyGet::new();
+    request.set_owner_id(session.get_id());
+    match params.find("origin") {
+        Some(origin) => request.set_origin(origin.to_string()),
+        None => return Ok(Response::with(status::BadRequest)),
+    };
+    match params.find("revision") {
+        Some(revision) => request.set_revision(revision.to_string()),
+        None => return Ok(Response::with(status::BadRequest)),
+    };
+
+    let key = match conn.route::<OriginPublicKeyGet, OriginPublicKey>(&request) {
+        Ok(key) => key,
+        Err(err) => {
+            error!("Can't retrieve key file: {}", err);
             return Ok(Response::with(status::NotFound));
         }
     };
 
-    let xfilename = origin_keyfile.file_name().unwrap().to_string_lossy().into_owned();
-    let mut response = Response::with((status::Ok, origin_keyfile));
-    response.headers.set(ContentDisposition(format!("attachment; filename=\"{}\"", xfilename)));
+    let xfilename = format!("{}-{}.pub", key.get_name(), key.get_revision());
+    let mut response = Response::with((status::Ok, key.get_body()));
+    response
+        .headers
+        .set(ContentDisposition(format!("attachment; filename=\"{}\"", xfilename)));
     response.headers.set(XFileName(xfilename));
     do_cache_response(&mut response);
     Ok(response)
 }
 
 fn download_latest_origin_key(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
     let params = req.extensions.get::<Router>().unwrap();
-    let origin = match params.find("origin") {
-        Some(origin) => origin,
+    // TODO: SA - Eliminate need to clone the session and params
+    let session = req.extensions.get::<Authenticated>().unwrap().clone();
+    let mut conn = Broker::connect().unwrap();
+    let mut request = OriginPublicKeyLatestGet::new();
+    request.set_owner_id(session.get_id());
+    match params.find("origin") {
+        Some(origin) => request.set_origin(origin.to_string()),
         None => return Ok(Response::with(status::BadRequest)),
     };
-    debug!("Trying to retrieve latest origin key for {}", &origin);
-    let latest_rev = depot.datastore.origin_keys.latest(&origin).unwrap();
-    let origin_keyfile = depot.key_path(&origin, &latest_rev);
-    debug!("Looking for {}", &origin_keyfile.to_string_lossy());
-    match origin_keyfile.metadata() {
-        Ok(md) => {
-            if !md.is_file() {
-                return Ok(Response::with(status::NotFound));
-            };
-        }
-        Err(e) => {
-            println!("Can't read key file {}: {}",
-                     &origin_keyfile.to_string_lossy(),
-                     e);
+
+    let key = match conn.route::<OriginPublicKeyLatestGet, OriginPublicKey>(&request) {
+        Ok(key) => key,
+        Err(err) => {
+            error!("Can't retrieve key file: {}", err);
             return Ok(Response::with(status::NotFound));
         }
     };
 
-    let xfilename = origin_keyfile.file_name().unwrap().to_string_lossy().into_owned();
-    let mut response = Response::with((status::Ok, origin_keyfile));
-    response.headers.set(ContentDisposition(format!("attachment; filename=\"{}\"", xfilename)));
+    let xfilename = format!("{}-{}.pub", key.get_name(), key.get_revision());
+    let mut response = Response::with((status::Ok, key.get_body()));
+    response
+        .headers
+        .set(ContentDisposition(format!("attachment; filename=\"{}\"", xfilename)));
     response.headers.set(XFileName(xfilename));
     dont_cache_response(&mut response);
     Ok(response)
 }
 
-
-
 fn download_package(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
-    let params = req.extensions.get::<Router>().unwrap();
-    let ident = ident_from_params(params);
+    let lock = req.get::<persistent::State<DepotUtil>>()
+        .expect("depot not found");
+    let depot = lock.read().expect("depot read lock is poisoned");
+    let mut ident_req = OriginPackageGet::new();
+    {
+        let params = req.extensions.get::<Router>().unwrap();
+        ident_req.set_ident(ident_from_params(params));
+    };
     let agent_target = target_from_headers(&req.headers.get::<UserAgent>().unwrap()).unwrap();
-    if agent_target != depot.config.supported_target {
+    if !depot.config.supported_targets.contains(&agent_target) {
         error!("Unsupported client platform ({}) for this depot.",
                agent_target);
         return Ok(Response::with(status::NotImplemented));
     }
 
-    match depot.datastore.packages.find(&ident) {
-        Ok(ident) => {
-            if let Some(archive) = depot.archive(&ident) {
+    match route_message::<OriginPackageGet, OriginPackage>(req, &ident_req) {
+        Ok(package) => {
+            if let Some(archive) = depot.archive(package.get_ident(), &agent_target) {
                 match fs::metadata(&archive.path) {
                     Ok(_) => {
                         let mut response = Response::with((status::Ok, archive.path.clone()));
                         do_cache_response(&mut response);
-                        response.headers
-                            .set(ContentDisposition(format!("attachment; filename=\"{}\"",
-                                                            archive.file_name())));
+                        let disp = ContentDisposition {
+                            disposition: DispositionType::Attachment,
+                            parameters: vec![DispositionParam::Filename(Charset::Iso_8859_1,
+                                                                        None,
+                                                                        archive
+                                                                            .file_name()
+                                                                            .as_bytes()
+                                                                            .to_vec())],
+                        };
+                        response.headers.set(disp);
                         response.headers.set(XFileName(archive.file_name()));
                         Ok(response)
                     }
@@ -695,284 +962,500 @@ fn download_package(req: &mut Request) -> IronResult<Response> {
                         data integrity.");
             }
         }
-        Err(dbcache::Error::EntityNotFound) => Ok(Response::with((status::NotFound))),
-        Err(e) => {
-            error!("download_package:1, err={:?}", e);
-            Ok(Response::with(status::InternalServerError))
+        Err(err) => {
+            match err.get_code() {
+                ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                _ => {
+                    error!("download_package:1, err={:?}", err);
+                    Ok(Response::with(status::InternalServerError))
+                }
+            }
         }
     }
 }
 
 fn list_origin_keys(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
-    let params = req.extensions.get::<Router>().unwrap();
-    let origin = params.find("origin").unwrap();
-    match depot.datastore.origin_keys.all(origin) {
-        Ok(revisions) => {
-            let body = serde_json::to_string(&revisions).unwrap();
+    let origin_name: String;
+    {
+        let params = req.extensions.get::<Router>().unwrap();
+        origin_name = match params.find("origin") {
+            Some(origin) => origin.to_string(),
+            None => return Ok(Response::with(status::BadRequest)),
+        }
+    };
+
+    let mut request = OriginPublicKeyListRequest::new();
+    match try!(get_origin(req, origin_name.as_str())) {
+        Some(origin) => request.set_origin_id(origin.get_id()),
+        None => return Ok(Response::with(status::NotFound)),
+    };
+    match route_message::<OriginPublicKeyListRequest, OriginPublicKeyListResponse>(req, &request) {
+        Ok(list) => {
+            let list: Vec<OriginKeyIdent> = list.get_keys()
+                .iter()
+                .map(|key| {
+                    let mut ident = OriginKeyIdent::new();
+                    ident.set_location(format!("/origins/{}/keys/{}",
+                                               &key.get_name(),
+                                               &key.get_revision()));
+                    ident.set_origin(key.get_name().to_string());
+                    ident.set_revision(key.get_revision().to_string());
+                    ident
+                })
+                .collect();
+            let body = serde_json::to_string(&list).unwrap();
             let mut response = Response::with((status::Ok, body));
             dont_cache_response(&mut response);
             Ok(response)
         }
-        Err(e) => {
-            error!("list_origin_keys:1, err={:?}", e);
-            Ok(Response::with(status::InternalServerError))
-        }
+        Err(err) => Ok(render_net_error(&err)),
     }
 }
 
 fn list_unique_packages(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
+    let mut request = OriginPackageUniqueListRequest::new();
     let (start, stop) = match extract_pagination(req) {
         Ok(range) => range,
         Err(response) => return Ok(response),
     };
-    let params = req.extensions.get::<Router>().unwrap();
-    let ident: String = match params.find("origin") {
-        Some(origin) => origin.to_string(),
-        None => return Ok(Response::with(status::BadRequest)),
+    request.set_start(start as u64);
+    request.set_stop(stop as u64);
+    {
+        let params = req.extensions.get::<Router>().unwrap();
+        match params.find("origin") {
+            Some(origin) => request.set_origin(origin.to_string()),
+            None => return Ok(Response::with(status::BadRequest)),
+        }
     };
 
-    match depot.datastore.packages.index.unique(&ident, start, stop) {
+    match route_message::<OriginPackageUniqueListRequest,
+                          OriginPackageUniqueListResponse>(req, &request) {
         Ok(packages) => {
-            let count = depot.datastore.packages.index.count_unique(&ident).unwrap();
             debug!("list_unique_packages start: {}, stop: {}, total count: {}",
-                   start,
-                   stop,
-                   count);
-            let body = package_results_json(&packages, count as isize, start, stop);
+                   packages.get_start(),
+                   packages.get_stop(),
+                   packages.get_count());
+            let body = package_results_json(&packages.get_idents().to_vec(),
+                                            packages.get_count() as isize,
+                                            packages.get_start() as isize,
+                                            packages.get_stop() as isize);
 
-            let mut response = if count as isize > (stop + 1) {
+            let mut response = if packages.get_count() as isize >
+                                  (packages.get_stop() as isize + 1) {
                 Response::with((status::PartialContent, body))
             } else {
                 Response::with((status::Ok, body))
             };
 
-            response.headers.set(ContentType(Mime(TopLevel::Application,
-                                                  SubLevel::Json,
-                                                  vec![(Attr::Charset, Value::Utf8)])));
+            response
+                .headers
+                .set(ContentType(Mime(TopLevel::Application,
+                                      SubLevel::Json,
+                                      vec![(Attr::Charset, Value::Utf8)])));
             dont_cache_response(&mut response);
             Ok(response)
         }
-        Err(Error::DataStore(dbcache::Error::EntityNotFound)) => {
-            Ok(Response::with((status::NotFound)))
-        }
-        Err(e) => {
-            error!("list_packages:2, err={:?}", e);
-            Ok(Response::with(status::InternalServerError))
+        Err(err) => {
+            match err.get_code() {
+                ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                _ => {
+                    error!("list_unique_packages:2, err={:?}", err);
+                    Ok(Response::with(status::InternalServerError))
+                }
+            }
         }
     }
 }
 
 fn list_packages(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
     let (start, stop) = match extract_pagination(req) {
         Ok(range) => range,
         Err(response) => return Ok(response),
     };
-    let params = req.extensions.get::<Router>().unwrap();
-    let ident: String = if params.find("pkg").is_none() {
-        match params.find("origin") {
+
+    let (ident, channel) = {
+        let params = req.extensions.get::<Router>().unwrap();
+
+        let origin = match params.find("origin") {
             Some(origin) => origin.to_string(),
-            None => return Ok(Response::with(status::BadRequest)),
-        }
-    } else {
-        ident_from_params(params).to_string()
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+
+        let ident: String = if params.find("pkg").is_none() {
+            origin
+        } else {
+            ident_from_params(params).to_string()
+        };
+
+        let channel = match params.find("channel") {
+            Some(ch) => Some(ch.to_string()),
+            None => None,
+        };
+
+        (ident, channel)
     };
 
-    if let Some(channel) = params.find("channel") {
-        match depot.datastore.channels.channel_pkg_idx.all(channel, &ident) {
-            Ok(packages) => {
-                let count = depot.datastore.packages.index.count(&ident).unwrap();
-                let body = package_results_json(&packages, count as isize, start, stop);
-
-                let mut response = if count as isize > (stop + 1) {
-                    Response::with((status::PartialContent, body))
-                } else {
-                    Response::with((status::Ok, body))
-                };
-
-                response.headers.set(ContentType(Mime(TopLevel::Application,
-                                                      SubLevel::Json,
-                                                      vec![(Attr::Charset, Value::Utf8)])));
-                dont_cache_response(&mut response);
-                Ok(response)
-            }
-            Err(Error::DataStore(dbcache::Error::EntityNotFound)) => {
-                Ok(Response::with((status::NotFound)))
-            }
-            Err(e) => {
-                error!("list_packages:1, err={:?}", e);
-                Ok(Response::with(status::InternalServerError))
-            }
+    let packages: RouteResult<OriginPackageListResponse>;
+    match channel {
+        Some(channel) => {
+            let mut request = OriginChannelPackageListRequest::new();
+            request.set_name(channel);
+            request.set_start(start as u64);
+            request.set_stop(stop as u64);
+            request.set_ident(OriginPackageIdent::from_str(ident.as_str()).expect("invalid package identifier"));
+            packages = route_message::<OriginChannelPackageListRequest,
+                                       OriginPackageListResponse>(req, &request);
         }
-    } else {
-        match depot.datastore.packages.index.list(&ident, start, stop) {
-            Ok(packages) => {
-                let count = depot.datastore.packages.index.count(&ident).unwrap();
-                debug!("list_packages start: {}, stop: {}, total count: {}",
-                       start,
-                       stop,
-                       count);
-                let body = package_results_json(&packages, count as isize, start, stop);
+        None => {
+            let mut request = OriginPackageListRequest::new();
+            request.set_start(start as u64);
+            request.set_stop(stop as u64);
+            request.set_ident(OriginPackageIdent::from_str(ident.as_str()).expect("invalid package identifier"));
+            packages = route_message::<OriginPackageListRequest,
+                                       OriginPackageListResponse>(req, &request);
+        }
+    }
 
-                let mut response = if count as isize > (stop + 1) {
-                    Response::with((status::PartialContent, body))
-                } else {
-                    Response::with((status::Ok, body))
-                };
+    match packages {
+        Ok(packages) => {
+            debug!("list_packages start: {}, stop: {}, total count: {}",
+                   packages.get_start(),
+                   packages.get_stop(),
+                   packages.get_count());
+            let body = package_results_json(&packages.get_idents().to_vec(),
+                                            packages.get_count() as isize,
+                                            packages.get_start() as isize,
+                                            packages.get_stop() as isize);
 
-                response.headers.set(ContentType(Mime(TopLevel::Application,
-                                                      SubLevel::Json,
-                                                      vec![(Attr::Charset, Value::Utf8)])));
-                dont_cache_response(&mut response);
-                Ok(response)
-            }
-            Err(Error::DataStore(dbcache::Error::EntityNotFound)) => {
-                Ok(Response::with((status::NotFound)))
-            }
-            Err(e) => {
-                error!("list_packages:2, err={:?}", e);
-                Ok(Response::with(status::InternalServerError))
+            let mut response = if packages.get_count() as isize >
+                                  (packages.get_stop() as isize + 1) {
+                Response::with((status::PartialContent, body))
+            } else {
+                Response::with((status::Ok, body))
+            };
+
+            response
+                .headers
+                .set(ContentType(Mime(TopLevel::Application,
+                                      SubLevel::Json,
+                                      vec![(Attr::Charset, Value::Utf8)])));
+            dont_cache_response(&mut response);
+            Ok(response)
+        }
+        Err(err) => {
+            match err.get_code() {
+                ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                _ => {
+                    error!("list_packages:2, err={:?}", err);
+                    Ok(Response::with(status::InternalServerError))
+                }
             }
         }
     }
 }
 
 fn list_channels(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
-    let channels = try!(depot.datastore.channels.all());
-    let body = serde_json::to_string(&channels).unwrap();
+    let session_id: u64;
+    let origin_name: String;
+    {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        session_id = session.get_id();
 
-    let mut response = Response::with((status::Ok, body));
-    dont_cache_response(&mut response);
-    Ok(response)
+        let params = req.extensions.get::<Router>().unwrap();
+        origin_name = match params.find("origin") {
+            Some(origin) => origin.to_string(),
+            None => return Ok(Response::with(status::BadRequest)),
+        }
+    };
+
+    if !try!(check_origin_access(req, session_id, &origin_name)) {
+        return Ok(Response::with(status::Forbidden));
+    }
+
+    let mut request = OriginChannelListRequest::new();
+    match try!(get_origin(req, origin_name.as_str())) {
+        Some(origin) => request.set_origin_id(origin.get_id()),
+        None => return Ok(Response::with(status::NotFound)),
+    };
+
+    match route_message::<OriginChannelListRequest, OriginChannelListResponse>(req, &request) {
+        Ok(list) => {
+            let list: Vec<OriginChannelIdent> = list.get_channels()
+                .iter()
+                .map(|channel| {
+                         let mut ident = OriginChannelIdent::new();
+                         ident.set_name(channel.get_name().to_string());
+                         ident
+                     })
+                .collect();
+            let body = serde_json::to_string(&list).unwrap();
+            let mut response = Response::with((status::Ok, body));
+            dont_cache_response(&mut response);
+            Ok(response)
+        }
+        Err(err) => Ok(render_net_error(&err)),
+    }
 }
 
-fn show_package(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
-    let params = req.extensions.get::<Router>().unwrap();
-    let mut ident = ident_from_params(params);
+fn create_channel(req: &mut Request) -> IronResult<Response> {
+    let session_id: u64;
+    let origin: String;
+    let channel: String;
 
-    if let Some(channel) = params.find("channel") {
-        if !ident.fully_qualified() {
-            match depot.datastore.channels.channel_pkg_idx.latest(channel, &ident.to_string()) {
-                Ok(ident) => {
-                    match depot.datastore.packages.find(&ident) {
-                        Ok(pkg) => render_package(&pkg, false),
-                        Err(dbcache::Error::EntityNotFound) => Ok(Response::with(status::NotFound)),
-                        Err(e) => {
-                            error!("show_package:1, err={:?}", e);
-                            Ok(Response::with(status::InternalServerError))
-                        }
-                    }
+    {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        session_id = session.get_id();
+        let params = req.extensions.get::<Router>().unwrap();
+        origin = match params.find("origin") {
+            Some(origin) => origin.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+        channel = match params.find("channel") {
+            Some(channel) => channel.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+    }
+
+    let mut request = OriginChannelCreate::new();
+
+    request.set_owner_id(session_id);
+    request.set_origin_name(origin);
+    request.set_name(channel);
+
+    match route_message::<OriginChannelCreate, OriginChannel>(req, &request) {
+        Ok(origin_channel) => Ok(render_json(status::Created, &origin_channel)),
+        Err(err) => Ok(render_net_error(&err)),
+    }
+}
+
+fn delete_channel(req: &mut Request) -> IronResult<Response> {
+    let session_id: u64;
+    let origin: String;
+    let channel: String;
+    {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        session_id = session.get_id();
+        let params = req.extensions.get::<Router>().unwrap();
+        origin = match params.find("origin") {
+            Some(origin) => origin.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+        channel = match params.find("channel") {
+            Some(channel) => channel.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+    }
+
+    let mut channel_req = OriginChannelGet::new();
+    channel_req.set_origin_name(origin.clone());
+    channel_req.set_name(channel.clone());
+    match route_message::<OriginChannelGet, OriginChannel>(req, &channel_req) {
+        Ok(origin_channel) => {
+            // make sure the person trying to create the channel has access to do so
+            if !try!(check_origin_access(req, session_id, &origin)) {
+                return Ok(Response::with(status::Forbidden));
+            }
+
+            // stable and unstable can't be deleted
+            if channel == "stable" || channel == "unstable" {
+                return Ok(Response::with(status::Forbidden));
+            }
+
+            let mut delete = OriginChannelDelete::new();
+            delete.set_id(origin_channel.get_id());
+            delete.set_origin_id(origin_channel.get_origin_id());
+            match route_message::<OriginChannelDelete, NetOk>(req, &delete) {
+                Ok(_) => Ok(Response::with(status::Ok)),
+                Err(err) => {
+                    error!("Error deleting channel, {}", err);
+                    Ok(render_net_error(&err))
                 }
-                Err(Error::DataStore(dbcache::Error::EntityNotFound)) => {
-                    Ok(Response::with(status::NotFound))
-                }
-                Err(e) => {
-                    error!("show_package:2, err={:?}", e);
+            }
+        }
+        Err(err) => {
+            match err.get_code() {
+                ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                _ => {
+                    error!("delete_channel:1, err={:?}", err);
                     Ok(Response::with(status::InternalServerError))
                 }
             }
-        } else {
-            match depot.datastore.channels.channel_pkg_idx.is_member(channel, &ident) {
-                Ok(true) => {
-                    match depot.datastore.packages.find(&ident) {
-                        Ok(pkg) => render_package(&pkg, false),
-                        Err(dbcache::Error::EntityNotFound) => Ok(Response::with(status::NotFound)),
-                        Err(e) => {
-                            error!("show_package:3, err={:?}", e);
-                            Ok(Response::with(status::InternalServerError))
+        }
+    }
+}
+
+fn show_package(req: &mut Request) -> IronResult<Response> {
+    let (mut ident, channel) = {
+        let params = req.extensions.get::<Router>().unwrap();
+
+        if params.find("origin").is_none() {
+            return Ok(Response::with(status::BadRequest));
+        }
+
+        let ident = ident_from_params(params);
+
+        let channel = match params.find("channel") {
+            Some(ch) => Some(ch.to_owned()),
+            None => None,
+        };
+
+        (ident, channel)
+    };
+
+    let qualified = ident.fully_qualified();
+
+    if let Some(channel) = channel {
+        if !qualified {
+            let target = target_from_headers(&req.headers.get::<UserAgent>().unwrap())
+                .unwrap()
+                .to_string();
+            let mut request = OriginChannelPackageLatestGet::new();
+            request.set_name(channel.clone());
+            request.set_ident(ident);
+            request.set_target(target);
+            match route_message::<OriginChannelPackageLatestGet, OriginPackageIdent>(req,
+                                                                                     &request) {
+                Ok(id) => ident = id.into(),
+                Err(err) => {
+                    match err.get_code() {
+                        ErrCode::ENTITY_NOT_FOUND => return Ok(Response::with((status::NotFound))),
+                        _ => {
+                            error!("show_package:2, err={:?}", err);
+                            return Ok(Response::with(status::InternalServerError));
                         }
                     }
                 }
-                Ok(false) => Ok(Response::with(status::NotFound)),
-                Err(e) => {
-                    error!("show_package:4, err={:?}", e);
-                    Ok(Response::with(status::InternalServerError))
+            }
+        }
+
+        let mut request = OriginChannelPackageGet::new();
+        request.set_name(channel);
+        request.set_ident(ident);
+        match route_message::<OriginChannelPackageGet, OriginPackage>(req, &request) {
+            Ok(pkg) => render_package(&pkg, false),
+            Err(err) => {
+                match err.get_code() {
+                    ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                    _ => {
+                        error!("show_package:3, err={:?}", err);
+                        Ok(Response::with(status::InternalServerError))
+                    }
                 }
             }
         }
     } else {
-        if !ident.fully_qualified() {
-            match depot.datastore.packages.index.latest(&ident) {
+        if !qualified {
+            let target = target_from_headers(&req.headers.get::<UserAgent>().unwrap())
+                .unwrap()
+                .to_string();
+            let mut request = OriginPackageLatestGet::new();
+            request.set_ident(ident);
+            request.set_target(target);
+            match route_message::<OriginPackageLatestGet, OriginPackageIdent>(req, &request) {
                 Ok(id) => ident = id.into(),
-                Err(Error::DataStore(dbcache::Error::EntityNotFound)) => {
-                    return Ok(Response::with(status::NotFound));
-                }
-                Err(e) => {
-                    error!("show_package:5, err={:?}", e);
-                    return Ok(Response::with(status::InternalServerError));
+                Err(err) => {
+                    match err.get_code() {
+                        ErrCode::ENTITY_NOT_FOUND => return Ok(Response::with((status::NotFound))),
+                        _ => {
+                            error!("show_package:5, err={:?}", err);
+                            return Ok(Response::with(status::InternalServerError));
+                        }
+                    }
                 }
             }
         }
 
-        match depot.datastore.packages.find(&ident) {
+        let mut request = OriginPackageGet::new();
+        request.set_ident(ident);
+        match route_message::<OriginPackageGet, OriginPackage>(req, &request) {
             Ok(pkg) => {
                 // If the request was for a fully qualified ident, cache the response, otherwise do
                 // not cache
-                if ident.fully_qualified() {
+                if qualified {
                     render_package(&pkg, true)
                 } else {
                     render_package(&pkg, false)
                 }
             }
-            Err(dbcache::Error::EntityNotFound) => Ok(Response::with(status::NotFound)),
-            Err(e) => {
-                error!("show_package:6, err={:?}", e);
-                Ok(Response::with(status::InternalServerError))
+            Err(err) => {
+                match err.get_code() {
+                    ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                    _ => {
+                        error!("show_package:6, err={:?}", err);
+                        Ok(Response::with(status::InternalServerError))
+                    }
+                }
             }
         }
     }
 }
 
 fn search_packages(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
+    let mut request = OriginPackageSearchRequest::new();
     let (start, stop) = match extract_pagination(req) {
         Ok(range) => range,
         Err(response) => return Ok(response),
     };
-    let params = req.extensions.get::<Router>().unwrap();
-    let partial = params.find("query").unwrap();
+    request.set_start(start as u64);
+    request.set_stop(stop as u64);
 
-    debug!("search_packages called with: {}", partial);
-    Counter::SearchPackages.increment();
-    Gauge::PackageCount.set(depot.datastore.key_count().unwrap() as f64);
-
-    // Note: the search call takes offset and count values
-    let (packages, total_count) =
-        depot.datastore.packages.index.search(partial, start, stop - start + 1).unwrap();
-
-    debug!("search_packages offset: {}, count: {}, packages len: {}, total_count: {}",
-           start,
-           stop - start + 1,
-           packages.len(),
-           total_count);
-
-    let body = package_results_json(&packages, total_count, start, stop);
-
-    let mut response = if total_count > (stop + 1) {
-        Response::with((status::PartialContent, body))
-    } else {
-        Response::with((status::Ok, body))
+    {
+        let params = req.extensions.get::<Router>().unwrap();
+        request.set_query(params.find("query").unwrap().to_string());
     };
 
-    response.headers.set(ContentType(Mime(TopLevel::Application,
-                                          SubLevel::Json,
-                                          vec![(Attr::Charset, Value::Utf8)])));
+    debug!("search_packages called with: {}", request.get_query());
 
-    dont_cache_response(&mut response);
-    Ok(response)
+    // Not sure if we need this
+    // Counter::SearchPackages.increment();
+    // Gauge::PackageCount.set(depot.datastore.key_count().unwrap() as f64);
+
+    // TODO MW: constraining to core is temporary until we have a cross origin index
+    request.set_origin("core".to_string());
+    match route_message::<OriginPackageSearchRequest, OriginPackageListResponse>(req, &request) {
+        Ok(packages) => {
+            debug!("search_packages start: {}, stop: {}, total count: {}",
+                   packages.get_start(),
+                   packages.get_stop(),
+                   packages.get_count());
+            let body = package_results_json(&packages.get_idents().to_vec(),
+                                            packages.get_count() as isize,
+                                            packages.get_start() as isize,
+                                            packages.get_stop() as isize);
+
+            let mut response = if packages.get_count() as isize >
+                                  (packages.get_stop() as isize + 1) {
+                Response::with((status::PartialContent, body))
+            } else {
+                Response::with((status::Ok, body))
+            };
+
+            response
+                .headers
+                .set(ContentType(Mime(TopLevel::Application,
+                                      SubLevel::Json,
+                                      vec![(Attr::Charset, Value::Utf8)])));
+            dont_cache_response(&mut response);
+            Ok(response)
+        }
+        Err(err) => {
+            error!("search_packages:2, err={:?}", err);
+            Ok(Response::with(status::InternalServerError))
+        }
+    }
 }
 
-fn render_package(pkg: &depotsrv::Package, should_cache: bool) -> IronResult<Response> {
+fn render_package(pkg: &OriginPackage, should_cache: bool) -> IronResult<Response> {
     let body = serde_json::to_string(&pkg).unwrap();
     let mut response = Response::with((status::Ok, body));
-    response.headers.set(ETag(pkg.get_checksum().to_string()));
-    response.headers.set(ContentType(Mime(TopLevel::Application,
-                                          SubLevel::Json,
-                                          vec![(Attr::Charset, Value::Utf8)])));
+    response
+        .headers
+        .set(ETag(pkg.get_checksum().to_string()));
+    response
+        .headers
+        .set(ContentType(Mime(TopLevel::Application,
+                              SubLevel::Json,
+                              vec![(Attr::Charset, Value::Utf8)])));
     if should_cache {
         do_cache_response(&mut response);
     } else {
@@ -982,42 +1465,95 @@ fn render_package(pkg: &depotsrv::Package, should_cache: bool) -> IronResult<Res
 }
 
 fn promote_package(req: &mut Request) -> IronResult<Response> {
-    let depot = req.get::<persistent::Read<Depot>>().unwrap();
-    let session = req.extensions.get::<Authenticated>().unwrap();
-    let (channel, ident) = {
+    let (channel, ident, session_id) = {
+        let session = req.extensions.get::<Authenticated>().unwrap();
+        let session_id = session.get_id();
+
         let params = req.extensions.get::<Router>().unwrap();
-        let channel = params.find("channel").unwrap();
-        let ident = ident_from_params(params);
-        (channel, ident)
+        let origin = match params.find("origin") {
+            Some(o) => o.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+
+        let channel = match params.find("channel") {
+            Some(c) => c.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+
+        let pkg = match params.find("pkg") {
+            Some(p) => p.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+
+        let version = match params.find("version") {
+            Some(v) => v.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+
+        let release = match params.find("release") {
+            Some(r) => r.to_string(),
+            _ => return Ok(Response::with(status::BadRequest)),
+        };
+
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin(origin);
+        ident.set_name(pkg);
+        ident.set_version(version);
+        ident.set_release(release);
+
+        (channel, ident, session_id)
     };
-    let mut conn = Broker::connect().unwrap();
-    match depot.datastore.channels.is_member(channel) {
-        Ok(true) => {
-            if !try!(check_origin_access(&mut conn, session.get_id(), &ident.get_origin())) {
+
+    let mut channel_req = OriginChannelGet::new();
+    channel_req.set_origin_name(ident.get_origin().to_string());
+    channel_req.set_name(channel);
+    match route_message::<OriginChannelGet, OriginChannel>(req, &channel_req) {
+        Ok(origin_channel) => {
+            if !try!(check_origin_access(req, session_id, &ident.get_origin())) {
                 return Ok(Response::with(status::Forbidden));
             }
-            match depot.datastore.packages.find(&ident) {
+
+            let mut request = OriginPackageGet::new();
+            request.set_ident(ident.clone());
+            match route_message::<OriginPackageGet, OriginPackage>(req, &request) {
                 Ok(package) => {
-                    depot.datastore.channels.associate(channel, &package).unwrap();
-                    Ok(Response::with(status::Ok))
+                    let mut promote = OriginPackagePromote::new();
+                    promote.set_channel_id(origin_channel.get_id());
+                    promote.set_package_id(package.get_id());
+                    promote.set_ident(ident);
+                    match route_message::<OriginPackagePromote, NetOk>(req, &promote) {
+                        Ok(_) => Ok(Response::with(status::Ok)),
+                        Err(err) => {
+                            error!("Error promoting package, {}", err);
+                            Ok(render_net_error(&err))
+                        }
+                    }
                 }
-                Err(dbcache::Error::EntityNotFound) => Ok(Response::with(status::NotFound)),
-                Err(e) => {
-                    error!("promote:2, err={:?}", e);
-                    return Ok(Response::with(status::InternalServerError));
+                Err(err) => {
+                    match err.get_code() {
+                        ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                        _ => {
+                            error!("promote:2, err={:?}", err);
+                            Ok(Response::with(status::InternalServerError))
+                        }
+                    }
                 }
             }
         }
-        Ok(false) => Ok(Response::with(status::NotFound)),
-        Err(e) => {
-            error!("promote:1, err={:?}", e);
-            return Ok(Response::with(status::InternalServerError));
+        Err(err) => {
+            match err.get_code() {
+                ErrCode::ENTITY_NOT_FOUND => Ok(Response::with((status::NotFound))),
+                _ => {
+                    error!("promote_package:1, err={:?}", err);
+                    Ok(Response::with(status::InternalServerError))
+                }
+            }
         }
     }
 }
 
-fn ident_from_params(params: &Params) -> depotsrv::PackageIdent {
-    let mut ident = depotsrv::PackageIdent::new();
+fn ident_from_params(params: &Params) -> OriginPackageIdent {
+    let mut ident = OriginPackageIdent::new();
     ident.set_origin(params.find("origin").unwrap().to_string());
     ident.set_name(params.find("pkg").unwrap().to_string());
     if let Some(ver) = params.find("version") {
@@ -1035,7 +1571,8 @@ fn target_from_headers(user_agent_header: &UserAgent) -> result::Result<PackageT
 
     let user_agent_regex = Regex::new(r"(?P<client>\.*)\s\((?P<target>\w+-\w+); (?P<kernel>.*)\)")
         .unwrap();
-    let user_agent_capture = user_agent_regex.captures(user_agent)
+    let user_agent_capture = user_agent_regex
+        .captures(user_agent)
         .expect("Invalid user agent supplied.");
     match PackageTarget::from_str(&user_agent_capture["target"]) {
         Ok(target) => Ok(target),
@@ -1084,45 +1621,39 @@ fn extract_query_value(key: &str, req: &mut Request) -> Option<String> {
 }
 
 fn do_cache_response(response: &mut Response) {
-    response.headers.set(CacheControl(format!("public, max-age={}", ONE_YEAR_IN_SECS)));
+    response
+        .headers
+        .set(CacheControl(format!("public, max-age={}", ONE_YEAR_IN_SECS)));
 }
 
 fn dont_cache_response(response: &mut Response) {
-    response.headers.set(CacheControl(format!("private, no-cache, no-store")));
+    response
+        .headers
+        .set(CacheControl(format!("private, no-cache, no-store")));
 }
 
-pub fn router(depot: Depot) -> Result<Chain> {
-    let basic = Authenticated::new(&depot.config);
-    let worker = Authenticated::new(&depot.config).require(privilege::BUILD_WORKER);
-    let router = router!(
-        channels: get "/channels" => list_channels,
-        channel_packages: get "/channels/:channel/pkgs/:origin" => list_packages,
-        channel_packages_pkg: get "/channels/:channel/pkgs/:origin/:pkg" => list_packages,
-        channel_package_latest: get "/channels/:channel/pkgs/:origin/:pkg/latest" => show_package,
-        channel_packages_version:
-            get "/channels/:channel/pkgs/:origin/:pkg/:version" => list_packages,
-        channel_package_version_latest:
-            get "/channels/:channel/pkgs/:origin/:pkg/:version/latest" => show_package,
-        channel_package: get "/channels/:channel/pkgs/:origin/:pkg/:version/:release" => {
-            show_package
+pub fn routes<M: BeforeMiddleware + Clone>(insecure: bool, basic: M, worker: M) -> Router {
+    router!(
+        channels: get "/channels/:origin" => list_channels,
+        channel_packages: get "/channels/:origin/:channel/pkgs" => list_packages,
+        channel_packages_pkg: get "/channels/:origin/:channel/pkgs/:pkg" => list_packages,
+        channel_package_latest: get "/channels/:origin/:channel/pkgs/:pkg/latest" => show_package,
+        channel_packages_version: get
+            "/channels/:origin/:channel/pkgs/:pkg/:version" => list_packages,
+        channel_packages_version_latest: get
+            "/channels/:origin/:channel/pkgs/:pkg/:version/latest" => show_package,
+        channel_package_release: get
+            "/channels/:origin/:channel/pkgs/:pkg/:version/:release" => show_package,
+        channel_package_promote: put
+            "/channels/:origin/:channel/pkgs/:pkg/:version/:release/promote" => {
+            XHandler::new(promote_package).before(basic.clone())
         },
-        channel_package_promote:
-            post "/channels/:channel/pkgs/:origin/:pkg/:version/:release/promote" => {
-                XHandler::new(promote_package).before(basic.clone())
+        channel_create: post "/channels/:origin/:channel" => {
+            XHandler::new(create_channel).before(basic.clone())
         },
-        channel_package_download:
-            get "/channels/:channel/pkgs/:origin/:pkg/:version/:release/download" => {
-                download_package
+        channel_delete: delete "/channels/:origin/:channel" => {
+            XHandler::new(delete_channel).before(basic.clone())
         },
-
-        channel_origin_keys: get "/channels/:channel/origins/:origin/keys" => list_origin_keys,
-        channel_origin_key_latest: get "/channels/:channel/origins/:origin/keys/latest" => {
-            download_latest_origin_key
-        },
-        channel_origin_key: get "/channels/:channel/origins/:origin/keys/:revision" => {
-            download_origin_key
-        },
-
         package_search: get "/pkgs/search/:query" => search_packages,
         packages: get "/pkgs/:origin" => list_packages,
         packages_unique: get "/:origin/pkgs" => list_unique_packages,
@@ -1136,12 +1667,20 @@ pub fn router(depot: Depot) -> Result<Chain> {
             download_package
         },
         package_upload: post "/pkgs/:origin/:pkg/:version/:release" => {
-            if depot.config.insecure {
+            if insecure {
                 XHandler::new(upload_package)
             } else {
                 XHandler::new(upload_package).before(basic.clone())
             }
         },
+        schedule: post "/pkgs/schedule/:origin/:pkg" => {
+            if insecure {
+                XHandler::new(schedule)
+            } else {
+                XHandler::new(schedule).before(basic.clone())
+            }
+        },
+        schedule_get: get "/pkgs/schedule/:groupid" => get_schedule,
 
         origin_create: post "/origins" => {
             XHandler::new(origin_create).before(basic.clone())
@@ -1152,7 +1691,7 @@ pub fn router(depot: Depot) -> Result<Chain> {
         origin_key_latest: get "/origins/:origin/keys/latest" => download_latest_origin_key,
         origin_key: get "/origins/:origin/keys/:revision" => download_origin_key,
         origin_key_create: post "/origins/:origin/keys/:revision" => {
-            if depot.config.insecure {
+            if insecure {
                 XHandler::new(upload_origin_key)
             } else {
                 XHandler::new(upload_origin_key).before(basic.clone())
@@ -1162,35 +1701,49 @@ pub fn router(depot: Depot) -> Result<Chain> {
             XHandler::new(upload_origin_secret_key).before(basic.clone())
         },
         origin_secret_key_latest: get "/origins/:origin/secret_keys/latest" => {
-            if depot.config.insecure {
+            if insecure {
                 XHandler::new(download_latest_origin_secret_key)
             } else {
                 XHandler::new(download_latest_origin_secret_key).before(worker.clone())
             }
         },
+        // All of this API feels wrong to me.
         origin_invitation_create: post "/origins/:origin/users/:username/invitations" => {
             XHandler::new(invite_to_origin).before(basic.clone())
         },
+        origin_invitation_accept: put "/origins/:origin/invitations/:invitation_id" => {
+            XHandler::new(accept_invitation).before(basic.clone())
+        },
+        //origin_invitation_ignore: delete "/origins/:origin/invitations/:invitation_id" => {
+        //    XHandler::new(ignore_invitation).before(basic.clone())
+        //},
         origin_invitations: get "/origins/:origin/invitations" => {
             XHandler::new(list_origin_invitations).before(basic.clone())
         },
         origin_users: get "/origins/:origin/users" => {
             XHandler::new(list_origin_members).before(basic.clone())
         }
-    );
+    )
+}
+
+pub fn router(depot: DepotUtil) -> Result<Chain> {
+    let basic = Authenticated::new(&depot.config);
+    let worker = Authenticated::new(&depot.config).require(privilege::BUILD_WORKER);
+    let router = routes(depot.config.insecure, basic, worker);
     let mut chain = Chain::new(router);
-    chain.link(persistent::Read::<EventLog>::both(EventLogger::new("hab-depot",
+    chain.link(persistent::Read::<EventLog>::both(EventLogger::new(&depot.config.log_dir,
                                                                    depot.config.events_enabled)));
-    chain.link(persistent::Read::<Depot>::both(depot));
+    chain.link(persistent::State::<DepotUtil>::both(depot));
+
     chain.link_after(Cors);
     Ok(chain)
 }
 
 pub fn run(config: Config) -> Result<()> {
     let listen_addr = config.listen_addr.clone();
-    let depot = try!(Depot::new(config.clone()));
+    let depot = DepotUtil::new(config.clone());
     let v1 = try!(router(depot));
-    let broker = Broker::run(Depot::net_ident(), &config.route_addrs().clone());
+    let broker = Broker::run(DepotUtil::net_ident(), &config.route_addrs().clone());
 
     let mut mount = Mount::new();
     mount.mount("/v1", v1);
@@ -1205,5 +1758,1040 @@ impl From<Error> for IronError {
             error: Box::new(err),
             response: Response::with((status::InternalServerError, "Internal Habitat error")),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use iron::{self, method, Handler, Headers, Request, status, Url};
+    use iron::middleware::BeforeMiddleware;
+    use iron::prelude::*;
+    use iron_test::mock_stream::MockStream;
+    use iron_test::response;
+    use hyper;
+    use hyper::net::NetworkStream;
+    use hyper::buffer::BufReader;
+    use hyper::header::{Charset, ContentDisposition, DispositionType, DispositionParam};
+
+    use hab_core::crypto::hash;
+    use protocol::net::{self, ErrCode};
+    use protocol::sessionsrv::Session;
+
+    use std::env;
+    use std::fs::File;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    use super::*;
+    use super::super::DepotUtil;
+
+    #[derive(Clone)]
+    pub struct AuthenticatedTest;
+
+    impl BeforeMiddleware for AuthenticatedTest {
+        fn before(&self, _: &mut Request) -> IronResult<()> {
+            Ok(())
+        }
+    }
+
+    pub fn hart_file(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn iron_request(method: method::Method,
+                    path: &str,
+                    body: &mut Vec<u8>,
+                    headers: Headers,
+                    broker: TestableBroker)
+                    -> (IronResult<Response>, RoutedMessages) {
+        let url = Url::parse(path).unwrap();
+        let mut buffer = String::new();
+        buffer.push_str(&format!("{} {} HTTP/1.1\r\n", &method, url));
+        buffer.push_str(&format!("Content-Length: {}\r\n", body.len() as u64));
+        for header in headers.iter() {
+            buffer.push_str(&format!("{}: {}\r\n", header.name(), header.value_string()));
+        }
+        buffer.push_str("\r\n");
+        let mut bytes = buffer.as_bytes().to_vec();
+        bytes.append(body);
+        let mut stream = MockStream::new(Cursor::new(bytes));
+        let mut buf_reader = BufReader::new(&mut stream as &mut NetworkStream);
+
+        let addr = "127.0.0.1:3000".parse().unwrap();
+        let http_request = hyper::server::Request::new(&mut buf_reader, addr).unwrap();
+        let mut req = Request::from_http(http_request, addr, &iron::Protocol::http()).unwrap();
+
+
+        let mut config = Config::default();
+        config.path = env::temp_dir()
+            .join("depot-tests")
+            .to_string_lossy()
+            .to_string();
+        let depot = DepotUtil::new(config);
+        req.extensions.insert::<Authenticated>(Session::new());
+        req.extensions.insert::<TestableBroker>(broker);
+
+        let basic = AuthenticatedTest;
+        let worker = AuthenticatedTest;
+        let router = routes(true, basic, worker);
+        let mut chain = Chain::new(router);
+        chain.link(persistent::State::<DepotUtil>::both(depot));
+        chain.link(persistent::Read::<EventLog>::both(EventLogger::new("", false)));
+        let resp = chain.handle(&mut req);
+        let req_broker = req.extensions.get::<TestableBroker>().unwrap();
+        let msgs = req_broker.routed_messages();
+        (resp, msgs)
+    }
+
+    #[test]
+    fn list_public_keys() {
+        let mut broker: TestableBroker = Default::default();
+
+        let mut access_res = CheckOriginAccessResponse::new();
+        access_res.set_has_access(true);
+        broker.setup::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&access_res);
+
+        let mut origin_res = Origin::new();
+        origin_res.set_id(5000);
+        broker.setup::<OriginGet, Origin>(&origin_res);
+
+        let mut key_res = OriginPublicKeyListResponse::new();
+        let mut keys = protobuf::RepeatedField::new();
+
+        let mut key = OriginPublicKey::new();
+        key.set_name("my_name".to_string());
+        key.set_revision("my_rev".to_string());
+        keys.push(key);
+
+        let mut key2 = OriginPublicKey::new();
+        key2.set_name("my_name2".to_string());
+        key2.set_revision("my_rev2".to_string());
+        keys.push(key2);
+
+        key_res.set_keys(keys);
+        broker.setup::<OriginPublicKeyListRequest, OriginPublicKeyListResponse>(&key_res);
+
+        let (response, _) = iron_request(method::Get,
+                                         "http://localhost/origins/org/keys",
+                                         &mut Vec::new(),
+                                         Headers::new(),
+                                         broker);
+        let result_body = response::extract_body_to_string(response.unwrap());
+
+        assert_eq!(result_body,
+                   "[\
+            {\
+                \"origin\":\"my_name\",\
+                \"revision\":\"my_rev\",\
+                \"location\":\"/origins/my_name/keys/my_rev\"\
+            },\
+            {\
+                \"origin\":\"my_name2\",\
+                \"revision\":\"my_rev2\",\
+                \"location\":\"/origins/my_name2/keys/my_rev2\"\
+            }\
+        ]");
+    }
+
+    #[test]
+    fn upload_package() {
+        //Remove file saved from previous test
+        let mut config = Config::default();
+        config.path = env::temp_dir()
+            .join("depot-tests")
+            .to_string_lossy()
+            .to_string();
+        let depot = DepotUtil::new(config);
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin("core".to_string());
+        ident.set_name("cacerts".to_string());
+        ident.set_version("2017.01.17".to_string());
+        ident.set_release("20170209064044".to_string());
+        let target = PackageTarget::from_str("x86_64-windows").unwrap();
+        let file_name = depot.archive_path(&ident, &target);
+        let _ = fs::remove_file(&file_name);
+
+        //setup broker messages
+        let mut broker: TestableBroker = Default::default();
+        let mut access_res = CheckOriginAccessResponse::new();
+        access_res.set_has_access(true);
+        broker.setup::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&access_res);
+        broker.setup_error::<OriginPackageGet>(net::err(ErrCode::ENTITY_NOT_FOUND, ""));
+
+        let mut origin_res = Origin::new();
+        origin_res.set_id(5000);
+        broker.setup::<OriginGet, Origin>(&origin_res);
+
+        broker.setup::<OriginPackageCreate, OriginPackage>(&OriginPackage::new());
+
+        //inject hart fixture to upload
+        let mut body: Vec<u8> = Vec::new();
+        let path = hart_file("core-cacerts-2017.01.17-20170209064044-x86_64-windows.hart");
+        File::open(&path)
+            .unwrap()
+            .read_to_end(&mut body)
+            .unwrap();
+        let checksum = hash::hash_file(&path).unwrap();
+
+        let (resp, msgs) = iron_request(method::Post,
+                                    format!("http://localhost/pkgs/core/cacerts/2017.01.17/20170209064044?checksum={}", checksum).as_str(),
+                                    &mut body,
+                                    Headers::new(),
+                                    broker);
+
+        //assert headers
+        let response = resp.unwrap();
+        assert_eq!(response.status, Some(status::Created));
+        assert_eq!(response.headers.get::<headers::Location>(),
+                   Some(&headers::Location(format!("http://localhost/pkgs/core/cacerts/2017.01.17/20170209064044/download?checksum={}",
+                                                   checksum))));
+
+        //assert body
+        let result_body = response::extract_body_to_string(response);
+        assert_eq!(result_body,
+                   "/pkgs/core/cacerts/2017.01.17/20170209064044/download");
+        assert!(fs::metadata(&file_name).is_ok());
+
+        //assert we sent the corect data to postgres
+        let package_req = msgs.get::<OriginPackageCreate>().unwrap();
+        assert_eq!(package_req.get_origin_id(), 5000);
+        assert_eq!(package_req.get_ident().to_string(), ident.to_string());
+        assert_eq!(package_req.get_target().to_string(), target.to_string());
+    }
+
+    #[test]
+    fn download_package() {
+        //upload hart so it gets saved to disk
+        let mut upload_broker: TestableBroker = Default::default();
+        let mut access_res = CheckOriginAccessResponse::new();
+        access_res.set_has_access(true);
+        upload_broker.setup::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&access_res);
+        upload_broker.setup_error::<OriginPackageGet>(net::err(ErrCode::ENTITY_NOT_FOUND, ""));
+        upload_broker.setup::<OriginPackageCreate, OriginPackage>(&OriginPackage::new());
+
+        let mut body: Vec<u8> = Vec::new();
+        let path = hart_file("core-cacerts-2017.01.17-20170209064045-x86_64-windows.hart");
+        File::open(&path)
+            .unwrap()
+            .read_to_end(&mut body)
+            .unwrap();
+        let checksum = hash::hash_file(&path).unwrap();
+
+        iron_request(method::Post,
+                                    format!("http://localhost/pkgs/core/cacerts/2017.01.17/20170209064045?checksum={}", checksum).as_str(),
+                                    &mut body.clone(),
+                                    Headers::new(),
+                                    upload_broker);
+
+        let mut download_broker: TestableBroker = Default::default();
+
+        //setup our package db request
+        let mut package = OriginPackage::new();
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin("core".to_string());
+        ident.set_name("cacerts".to_string());
+        ident.set_version("2017.01.17".to_string());
+        ident.set_release("20170209064045".to_string());
+        package.set_ident(ident);
+        download_broker.setup::<OriginPackageGet, OriginPackage>(&package);
+
+        //set the user agent to look like a windows download
+        let mut headers = Headers::new();
+        headers.set(UserAgent("hab/0.20.0-dev/20170326090935 (x86_64-windows; 10.0.14915)"
+                                  .to_string()));
+
+        let (response, _) = iron_request(method::Get,
+                                         "http://localhost/pkgs/core/cacerts/2017.01.17/20170209064045/download",
+                                         &mut Vec::new(),
+                                         headers,
+                                         download_broker);
+
+        //assert headers
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+        let disp = ContentDisposition {
+            disposition: DispositionType::Attachment,
+            parameters: vec![DispositionParam::Filename(
+                Charset::Iso_8859_1,
+                None,
+                b"core-cacerts-2017.01.17-20170209064045-x86_64-windows.hart".to_vec()
+            )],
+        };
+        assert_eq!(response.headers.get::<ContentDisposition>(), Some(&disp));
+
+        //assert file content
+        let result_body = response::extract_body_to_bytes(response);
+        assert_eq!(result_body, body);
+    }
+
+    #[test]
+    fn list_unique_packages() {
+        let mut broker: TestableBroker = Default::default();
+
+        let mut pkg_res = OriginPackageUniqueListResponse::new();
+        pkg_res.set_start(0);
+        pkg_res.set_stop(1);
+        pkg_res.set_count(2);
+        let mut idents = protobuf::RepeatedField::new();
+
+        let mut ident1 = OriginPackageIdent::new();
+        ident1.set_origin("org".to_string());
+        ident1.set_name("name1".to_string());
+        idents.push(ident1);
+
+        let mut ident2 = OriginPackageIdent::new();
+        ident2.set_origin("org".to_string());
+        ident2.set_name("name2".to_string());
+        idents.push(ident2);
+
+        pkg_res.set_idents(idents);
+        broker.setup::<OriginPackageUniqueListRequest, OriginPackageUniqueListResponse>(&pkg_res);
+
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/org/pkgs?range=2",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+
+        assert_eq!(result_body,
+                   "{\
+            \"range_start\":0,\
+            \"range_end\":1,\
+            \"total_count\":2,\
+            \"package_list\":[\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name1\"\
+                },\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name2\"\
+                }\
+            ]\
+        }");
+
+        //assert we sent the corect range to postgres
+        let package_req = msgs.get::<OriginPackageUniqueListRequest>().unwrap();
+        assert_eq!(package_req.get_start(), 2);
+        assert_eq!(package_req.get_stop(), 51);
+    }
+
+    #[test]
+    fn list_packages() {
+        let mut broker: TestableBroker = Default::default();
+
+        let mut pkg_res = OriginPackageListResponse::new();
+        pkg_res.set_start(0);
+        pkg_res.set_stop(1);
+        pkg_res.set_count(2);
+        let mut packages = protobuf::RepeatedField::new();
+
+        let mut ident1 = OriginPackageIdent::new();
+        ident1.set_origin("org".to_string());
+        ident1.set_name("name1".to_string());
+        ident1.set_version("1.1.1".to_string());
+        ident1.set_release("20170101010101".to_string());
+        packages.push(ident1);
+
+        let mut ident2 = OriginPackageIdent::new();
+        ident2.set_origin("org".to_string());
+        ident2.set_name("name2".to_string());
+        ident2.set_version("2.2.2".to_string());
+        ident2.set_release("20170202020202".to_string());
+        packages.push(ident2);
+
+        pkg_res.set_idents(packages);
+        broker.setup::<OriginPackageListRequest, OriginPackageListResponse>(&pkg_res);
+
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/pkgs/org?range=2",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+
+        assert_eq!(result_body,
+                   "{\
+            \"range_start\":0,\
+            \"range_end\":1,\
+            \"total_count\":2,\
+            \"package_list\":[\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name1\",\
+                    \"version\":\"1.1.1\",\
+                    \"release\":\"20170101010101\"\
+                },\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name2\",\
+                    \"version\":\"2.2.2\",\
+                    \"release\":\"20170202020202\"\
+                }\
+            ]\
+        }");
+
+        //assert we sent the corect range to postgres
+        let package_req = msgs.get::<OriginPackageListRequest>().unwrap();
+        assert_eq!(package_req.get_start(), 2);
+        assert_eq!(package_req.get_stop(), 51);
+        assert_eq!(package_req.get_ident().to_string(), "org/".to_string());
+    }
+
+    #[test]
+    fn list_channel_packages() {
+        let mut broker: TestableBroker = Default::default();
+
+        let mut pkg_res = OriginPackageListResponse::new();
+        pkg_res.set_start(0);
+        pkg_res.set_stop(1);
+        pkg_res.set_count(2);
+        let mut packages = protobuf::RepeatedField::new();
+
+        let mut ident1 = OriginPackageIdent::new();
+        ident1.set_origin("org".to_string());
+        ident1.set_name("name1".to_string());
+        ident1.set_version("1.1.1".to_string());
+        ident1.set_release("20170101010101".to_string());
+        packages.push(ident1);
+
+        let mut ident2 = OriginPackageIdent::new();
+        ident2.set_origin("org".to_string());
+        ident2.set_name("name2".to_string());
+        ident2.set_version("2.2.2".to_string());
+        ident2.set_release("20170202020202".to_string());
+        packages.push(ident2);
+
+        pkg_res.set_idents(packages);
+        broker.setup::<OriginChannelPackageListRequest, OriginPackageListResponse>(&pkg_res);
+
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/channels/org/channel/pkgs?range=2",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+
+        assert_eq!(result_body,
+                   "{\
+            \"range_start\":0,\
+            \"range_end\":1,\
+            \"total_count\":2,\
+            \"package_list\":[\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name1\",\
+                    \"version\":\"1.1.1\",\
+                    \"release\":\"20170101010101\"\
+                },\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name2\",\
+                    \"version\":\"2.2.2\",\
+                    \"release\":\"20170202020202\"\
+                }\
+            ]\
+        }");
+
+        //assert we sent the corect range to postgres
+        let package_req = msgs.get::<OriginChannelPackageListRequest>().unwrap();
+        assert_eq!(package_req.get_start(), 2);
+        assert_eq!(package_req.get_stop(), 51);
+        assert_eq!(package_req.get_ident().to_string(), "org/".to_string());
+        assert_eq!(package_req.get_name().to_string(), "channel".to_string());
+    }
+
+    #[test]
+    fn show_package_fully_qualified() {
+        let mut show_broker: TestableBroker = Default::default();
+
+        //setup our package db request
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin("org".to_string());
+        ident.set_name("name".to_string());
+        ident.set_version("1.1.1".to_string());
+        ident.set_release("20170101010101".to_string());
+
+        let mut dep_idents = protobuf::RepeatedField::new();
+        let mut dep_ident = OriginPackageIdent::new();
+        dep_ident.set_origin("dep_org".to_string());
+        dep_ident.set_name("dep_name".to_string());
+        dep_ident.set_version("1.1.1-dep".to_string());
+        dep_ident.set_release("20170101010102".to_string());
+        dep_idents.push(dep_ident);
+
+        let mut tdep_idents = protobuf::RepeatedField::new();
+        let mut tdep_ident = OriginPackageIdent::new();
+        tdep_ident.set_origin("tdep_org".to_string());
+        tdep_ident.set_name("tdep_name".to_string());
+        tdep_ident.set_version("1.1.1-tdep".to_string());
+        tdep_ident.set_release("20170101010103".to_string());
+        tdep_idents.push(tdep_ident);
+
+        let mut package = OriginPackage::new();
+        package.set_ident(ident.clone());
+        package.set_checksum("checksum".to_string());
+        package.set_manifest("manifest".to_string());
+        package.set_deps(dep_idents);
+        package.set_tdeps(tdep_idents);
+        package.set_config("config".to_string());
+        package.set_target("x86_64-linux".to_string());
+
+        show_broker.setup::<OriginPackageGet, OriginPackage>(&package);
+
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/pkgs/org/name/1.1.1/20170101010101",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            show_broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+        assert_eq!(result_body,
+                   "{\
+            \"ident\":{\
+                \"origin\":\"org\",\
+                \"name\":\"name\",\
+                \"version\":\"1.1.1\",\
+                \"release\":\"20170101010101\"\
+            },\
+            \"checksum\":\"checksum\",\
+            \"manifest\":\"manifest\",\
+            \"target\":\"x86_64-linux\",\
+            \"deps\":[{\
+                \"origin\":\"dep_org\",\
+                \"name\":\"dep_name\",\
+                \"version\":\"1.1.1-dep\",\
+                \"release\":\"20170101010102\"\
+            }],\
+            \"tdeps\":[{\
+                \"origin\":\"tdep_org\",\
+                \"name\":\"tdep_name\",\
+                \"version\":\"1.1.1-tdep\",\
+                \"release\":\"20170101010103\"\
+            }],\
+            \"exposes\":[],\
+            \"config\":\"config\"\
+        }");
+
+        //assert we sent the corect range to postgres
+        let package_req = msgs.get::<OriginPackageGet>().unwrap();
+        assert_eq!(package_req.get_ident().to_string(), ident.to_string());
+    }
+
+    #[test]
+    fn show_package_fully_qualified_with_channel() {
+        let mut show_broker: TestableBroker = Default::default();
+
+        //setup our package db request
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin("org".to_string());
+        ident.set_name("name".to_string());
+        ident.set_version("1.1.1".to_string());
+        ident.set_release("20170101010101".to_string());
+
+        let mut dep_idents = protobuf::RepeatedField::new();
+        let mut dep_ident = OriginPackageIdent::new();
+        dep_ident.set_origin("dep_org".to_string());
+        dep_ident.set_name("dep_name".to_string());
+        dep_ident.set_version("1.1.1-dep".to_string());
+        dep_ident.set_release("20170101010102".to_string());
+        dep_idents.push(dep_ident);
+
+        let mut tdep_idents = protobuf::RepeatedField::new();
+        let mut tdep_ident = OriginPackageIdent::new();
+        tdep_ident.set_origin("tdep_org".to_string());
+        tdep_ident.set_name("tdep_name".to_string());
+        tdep_ident.set_version("1.1.1-tdep".to_string());
+        tdep_ident.set_release("20170101010103".to_string());
+        tdep_idents.push(tdep_ident);
+
+        let mut package = OriginPackage::new();
+        package.set_ident(ident.clone());
+        package.set_checksum("checksum".to_string());
+        package.set_manifest("manifest".to_string());
+        package.set_deps(dep_idents);
+        package.set_tdeps(tdep_idents);
+        package.set_config("config".to_string());
+        package.set_target("x86_64-linux".to_string());
+
+        show_broker.setup::<OriginChannelPackageGet, OriginPackage>(&package);
+
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/channels/org/channel/pkgs/name/1.1.1/20170101010101",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            show_broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+        assert_eq!(result_body,
+                   "{\
+            \"ident\":{\
+                \"origin\":\"org\",\
+                \"name\":\"name\",\
+                \"version\":\"1.1.1\",\
+                \"release\":\"20170101010101\"\
+            },\
+            \"checksum\":\"checksum\",\
+            \"manifest\":\"manifest\",\
+            \"target\":\"x86_64-linux\",\
+            \"deps\":[{\
+                \"origin\":\"dep_org\",\
+                \"name\":\"dep_name\",\
+                \"version\":\"1.1.1-dep\",\
+                \"release\":\"20170101010102\"\
+            }],\
+            \"tdeps\":[{\
+                \"origin\":\"tdep_org\",\
+                \"name\":\"tdep_name\",\
+                \"version\":\"1.1.1-tdep\",\
+                \"release\":\"20170101010103\"\
+            }],\
+            \"exposes\":[],\
+            \"config\":\"config\"\
+        }");
+
+        //assert we sent the corect range to postgres
+        let package_req = msgs.get::<OriginChannelPackageGet>().unwrap();
+        assert_eq!(package_req.get_ident().to_string(), ident.to_string());
+        assert_eq!(package_req.get_name().to_string(), "channel".to_string());
+    }
+
+    #[test]
+    fn show_package_latest() {
+        let mut show_broker: TestableBroker = Default::default();
+
+        //setup our full package
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin("org".to_string());
+        ident.set_name("name".to_string());
+        ident.set_version("1.1.1".to_string());
+        ident.set_release("20170101010101".to_string());
+
+        let mut dep_idents = protobuf::RepeatedField::new();
+        let mut dep_ident = OriginPackageIdent::new();
+        dep_ident.set_origin("dep_org".to_string());
+        dep_ident.set_name("dep_name".to_string());
+        dep_ident.set_version("1.1.1-dep".to_string());
+        dep_ident.set_release("20170101010102".to_string());
+        dep_idents.push(dep_ident);
+
+        let mut tdep_idents = protobuf::RepeatedField::new();
+        let mut tdep_ident = OriginPackageIdent::new();
+        tdep_ident.set_origin("tdep_org".to_string());
+        tdep_ident.set_name("tdep_name".to_string());
+        tdep_ident.set_version("1.1.1-tdep".to_string());
+        tdep_ident.set_release("20170101010103".to_string());
+        tdep_idents.push(tdep_ident);
+
+        let mut package = OriginPackage::new();
+        package.set_ident(ident.clone());
+        package.set_checksum("checksum".to_string());
+        package.set_manifest("manifest".to_string());
+        package.set_deps(dep_idents);
+        package.set_tdeps(tdep_idents);
+        package.set_config("config".to_string());
+        package.set_target("x86_64-linux".to_string());
+        show_broker.setup::<OriginPackageGet, OriginPackage>(&package);
+
+        //setup query for the latest ident
+        let mut latest_ident = OriginPackageIdent::new();
+        latest_ident.set_origin("org".to_string());
+        latest_ident.set_name("name".to_string());
+        latest_ident.set_version("1.1.1".to_string());
+        latest_ident.set_release("20170101010101".to_string());
+        show_broker.setup::<OriginPackageLatestGet, OriginPackageIdent>(&latest_ident);
+
+        //set the user agent to look like a linux download
+        let mut headers = Headers::new();
+        headers.set(UserAgent("hab/0.20.0-dev/20170326090935 (x86_64-linux; 9.9.9)".to_string()));
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/pkgs/org/name/latest",
+                                            &mut Vec::new(),
+                                            headers,
+                                            show_broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+        assert_eq!(result_body,
+                   "{\
+            \"ident\":{\
+                \"origin\":\"org\",\
+                \"name\":\"name\",\
+                \"version\":\"1.1.1\",\
+                \"release\":\"20170101010101\"\
+            },\
+            \"checksum\":\"checksum\",\
+            \"manifest\":\"manifest\",\
+            \"target\":\"x86_64-linux\",\
+            \"deps\":[{\
+                \"origin\":\"dep_org\",\
+                \"name\":\"dep_name\",\
+                \"version\":\"1.1.1-dep\",\
+                \"release\":\"20170101010102\"\
+            }],\
+            \"tdeps\":[{\
+                \"origin\":\"tdep_org\",\
+                \"name\":\"tdep_name\",\
+                \"version\":\"1.1.1-tdep\",\
+                \"release\":\"20170101010103\"\
+            }],\
+            \"exposes\":[],\
+            \"config\":\"config\"\
+        }");
+
+        //assert we sent the corect requests to postgres
+        let latest_req = msgs.get::<OriginPackageLatestGet>().unwrap();
+        assert_eq!(latest_req.get_ident().to_string(), "org/name".to_string());
+        assert_eq!(latest_req.get_target().to_string(),
+                   "x86_64-linux".to_string());
+        let package_req = msgs.get::<OriginPackageGet>().unwrap();
+        assert_eq!(package_req.get_ident().to_string(), ident.to_string());
+    }
+
+    #[test]
+    fn show_package_latest_with_channel() {
+        let mut show_broker: TestableBroker = Default::default();
+
+        //setup our full package
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin("org".to_string());
+        ident.set_name("name".to_string());
+        ident.set_version("1.1.1".to_string());
+        ident.set_release("20170101010101".to_string());
+
+        let mut dep_idents = protobuf::RepeatedField::new();
+        let mut dep_ident = OriginPackageIdent::new();
+        dep_ident.set_origin("dep_org".to_string());
+        dep_ident.set_name("dep_name".to_string());
+        dep_ident.set_version("1.1.1-dep".to_string());
+        dep_ident.set_release("20170101010102".to_string());
+        dep_idents.push(dep_ident);
+
+        let mut tdep_idents = protobuf::RepeatedField::new();
+        let mut tdep_ident = OriginPackageIdent::new();
+        tdep_ident.set_origin("tdep_org".to_string());
+        tdep_ident.set_name("tdep_name".to_string());
+        tdep_ident.set_version("1.1.1-tdep".to_string());
+        tdep_ident.set_release("20170101010103".to_string());
+        tdep_idents.push(tdep_ident);
+
+        let mut package = OriginPackage::new();
+        package.set_ident(ident.clone());
+        package.set_checksum("checksum".to_string());
+        package.set_manifest("manifest".to_string());
+        package.set_deps(dep_idents);
+        package.set_tdeps(tdep_idents);
+        package.set_config("config".to_string());
+        package.set_target("x86_64-linux".to_string());
+        show_broker.setup::<OriginChannelPackageGet, OriginPackage>(&package);
+
+        //setup query for the latest ident
+        let mut latest_ident = OriginPackageIdent::new();
+        latest_ident.set_origin("org".to_string());
+        latest_ident.set_name("name".to_string());
+        latest_ident.set_version("1.1.1".to_string());
+        latest_ident.set_release("20170101010101".to_string());
+        show_broker.setup::<OriginChannelPackageLatestGet, OriginPackageIdent>(&latest_ident);
+
+        //set the user agent to look like a linux download
+        let mut headers = Headers::new();
+        headers.set(UserAgent("hab/0.20.0-dev/20170326090935 (x86_64-linux; 9.9.9)".to_string()));
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/channels/org/channel/pkgs/name/latest",
+                                            &mut Vec::new(),
+                                            headers,
+                                            show_broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+        assert_eq!(result_body,
+                   "{\
+            \"ident\":{\
+                \"origin\":\"org\",\
+                \"name\":\"name\",\
+                \"version\":\"1.1.1\",\
+                \"release\":\"20170101010101\"\
+            },\
+            \"checksum\":\"checksum\",\
+            \"manifest\":\"manifest\",\
+            \"target\":\"x86_64-linux\",\
+            \"deps\":[{\
+                \"origin\":\"dep_org\",\
+                \"name\":\"dep_name\",\
+                \"version\":\"1.1.1-dep\",\
+                \"release\":\"20170101010102\"\
+            }],\
+            \"tdeps\":[{\
+                \"origin\":\"tdep_org\",\
+                \"name\":\"tdep_name\",\
+                \"version\":\"1.1.1-tdep\",\
+                \"release\":\"20170101010103\"\
+            }],\
+            \"exposes\":[],\
+            \"config\":\"config\"\
+        }");
+
+        //assert we sent the corect requests to postgres
+        let latest_req = msgs.get::<OriginChannelPackageLatestGet>().unwrap();
+        assert_eq!(latest_req.get_ident().to_string(), "org/name".to_string());
+        assert_eq!(latest_req.get_target().to_string(),
+                   "x86_64-linux".to_string());
+        assert_eq!(latest_req.get_name().to_string(), "channel".to_string());
+        let package_req = msgs.get::<OriginChannelPackageGet>().unwrap();
+        assert_eq!(package_req.get_ident().to_string(), ident.to_string());
+        assert_eq!(package_req.get_name().to_string(), "channel".to_string());
+    }
+
+    #[test]
+    fn search_packages() {
+        let mut broker: TestableBroker = Default::default();
+
+        let mut pkg_res = OriginPackageListResponse::new();
+        pkg_res.set_start(0);
+        pkg_res.set_stop(1);
+        pkg_res.set_count(2);
+        let mut packages = protobuf::RepeatedField::new();
+
+        let mut ident1 = OriginPackageIdent::new();
+        ident1.set_origin("org".to_string());
+        ident1.set_name("name1".to_string());
+        ident1.set_version("1.1.1".to_string());
+        ident1.set_release("20170101010101".to_string());
+        packages.push(ident1);
+
+        let mut ident2 = OriginPackageIdent::new();
+        ident2.set_origin("org".to_string());
+        ident2.set_name("name2".to_string());
+        ident2.set_version("2.2.2".to_string());
+        ident2.set_release("20170202020202".to_string());
+        packages.push(ident2);
+
+        pkg_res.set_idents(packages);
+        broker.setup::<OriginPackageSearchRequest, OriginPackageListResponse>(&pkg_res);
+
+        let (response, msgs) = iron_request(method::Get,
+                                            "http://localhost/pkgs/search/name?range=2",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let result_body = response::extract_body_to_string(response);
+
+        assert_eq!(result_body,
+                   "{\
+            \"range_start\":0,\
+            \"range_end\":1,\
+            \"total_count\":2,\
+            \"package_list\":[\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name1\",\
+                    \"version\":\"1.1.1\",\
+                    \"release\":\"20170101010101\"\
+                },\
+                {\
+                    \"origin\":\"org\",\
+                    \"name\":\"name2\",\
+                    \"version\":\"2.2.2\",\
+                    \"release\":\"20170202020202\"\
+                }\
+            ]\
+        }");
+
+        //assert we sent the corect range to postgres
+        let package_req = msgs.get::<OriginPackageSearchRequest>().unwrap();
+        assert_eq!(package_req.get_start(), 2);
+        assert_eq!(package_req.get_stop(), 51);
+        assert_eq!(package_req.get_query(), "name".to_string());
+    }
+
+    #[test]
+    fn list_channels() {
+        let mut broker: TestableBroker = Default::default();
+        let mut access_res = CheckOriginAccessResponse::new();
+
+        access_res.set_has_access(true);
+        broker.setup::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&access_res);
+
+        let mut origin_res = Origin::new();
+        origin_res.set_id(5000);
+        broker.setup::<OriginGet, Origin>(&origin_res);
+
+        let mut channel_res = OriginChannelListResponse::new();
+        let mut channels = protobuf::RepeatedField::new();
+
+        let mut channel = OriginChannel::new();
+        channel.set_name("my_channel".to_string());
+        channels.push(channel);
+
+        let mut channel2 = OriginChannel::new();
+        channel2.set_name("my_channel2".to_string());
+        channels.push(channel2);
+
+        channel_res.set_channels(channels);
+
+        broker.setup::<OriginChannelListRequest, OriginChannelListResponse>(&channel_res);
+
+        let (response, _) = iron_request(method::Get,
+                                         "http://localhost/channels/org",
+                                         &mut Vec::new(),
+                                         Headers::new(),
+                                         broker);
+        let result_body = response::extract_body_to_string(response.unwrap());
+
+        assert_eq!(result_body,
+                   "[\
+            {\
+                \"name\":\"my_channel\"\
+            },\
+            {\
+                \"name\":\"my_channel2\"\
+            }\
+        ]");
+    }
+
+    #[test]
+    fn create_channel() {
+        let mut broker: TestableBroker = Default::default();
+        let mut access_res = CheckOriginAccessResponse::new();
+
+        access_res.set_has_access(true);
+        broker.setup::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&access_res);
+
+        let mut origin_res = Origin::new();
+        origin_res.set_name(String::from("neurosis"));
+        origin_res.set_id(5000);
+        broker.setup::<OriginGet, Origin>(&origin_res);
+
+        let mut channel_res = OriginChannel::new();
+        channel_res.set_origin_id(5000);
+        channel_res.set_name("my_channel".to_string());
+
+        broker.setup::<OriginChannelCreate, OriginChannel>(&channel_res);
+
+        let (resp, msgs) = iron_request(method::Post,
+                                        "http://localhost/channels/neurosis/my_channel",
+                                        &mut Vec::new(),
+                                        Headers::new(),
+                                        broker);
+        let response = resp.unwrap();
+        assert_eq!(response.status, Some(status::Created));
+
+        let channel_req = msgs.get::<OriginChannelCreate>().unwrap();
+        assert_eq!(channel_req.get_origin_name(), "neurosis");
+        assert_eq!(channel_req.get_name(), "my_channel");
+    }
+
+    #[test]
+    fn promote_package() {
+        let mut broker: TestableBroker = Default::default();
+
+        //setup our full package
+        let mut ident = OriginPackageIdent::new();
+        ident.set_origin("org".to_string());
+        ident.set_name("name".to_string());
+        ident.set_version("1.1.1".to_string());
+        ident.set_release("20170101010101".to_string());
+
+        let mut package = OriginPackage::new();
+        package.set_id(5000);
+        package.set_ident(ident.clone());
+        package.set_checksum("checksum".to_string());
+        package.set_manifest("manifest".to_string());
+        package.set_config("config".to_string());
+        package.set_target("x86_64-linux".to_string());
+        broker.setup::<OriginPackageGet, OriginPackage>(&package);
+
+        let mut channel = OriginChannel::new();
+        channel.set_id(6000);
+        channel.set_name("my_channel".to_string());
+        broker.setup::<OriginChannelGet, OriginChannel>(&channel);
+
+        let mut access_res = CheckOriginAccessResponse::new();
+        access_res.set_has_access(true);
+        broker.setup::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&access_res);
+
+        broker.setup::<OriginPackagePromote, NetOk>(&NetOk::new());
+
+        let (response, msgs) = iron_request(method::Put,
+                                            "http://localhost/channels/org/my_channel/pkgs/name/1.1.1/20170101010101/promote",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        //assert we sent the corect range to postgres
+        let channel_get = msgs.get::<OriginChannelGet>().unwrap();
+        assert_eq!(channel_get.get_origin_name(), "org".to_string());
+        assert_eq!(channel_get.get_name(), "my_channel".to_string());
+
+        let package_get = msgs.get::<OriginPackageGet>().unwrap();
+        assert_eq!(package_get.get_ident().to_string(), ident.to_string());
+
+        let promote = msgs.get::<OriginPackagePromote>().unwrap();
+        assert_eq!(promote.get_channel_id(), 6000);
+        assert_eq!(promote.get_package_id(), 5000);
+        assert_eq!(promote.get_ident().to_string(), ident.to_string());
+    }
+
+    #[test]
+    fn channel_delete() {
+        let mut broker: TestableBroker = Default::default();
+
+        let mut access_res = CheckOriginAccessResponse::new();
+        access_res.set_has_access(true);
+        broker.setup::<CheckOriginAccessRequest, CheckOriginAccessResponse>(&access_res);
+
+        let mut channel = OriginChannel::new();
+        channel.set_id(6000);
+        channel.set_origin_id(5000);
+        broker.setup::<OriginChannelGet, OriginChannel>(&channel);
+
+        broker.setup::<OriginChannelDelete, NetOk>(&NetOk::new());
+
+        let (response, msgs) = iron_request(method::Delete,
+                                            "http://localhost/channels/org/my_channel",
+                                            &mut Vec::new(),
+                                            Headers::new(),
+                                            broker);
+
+        let response = response.unwrap();
+        assert_eq!(response.status, Some(status::Ok));
+
+        let delete = msgs.get::<OriginChannelDelete>().unwrap();
+        assert_eq!(delete.get_id(), 6000);
+        assert_eq!(delete.get_origin_id(), 5000);
     }
 }

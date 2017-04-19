@@ -96,7 +96,7 @@ pub fn get() -> App<'static, 'static> {
                     (about: "Outputs the latest origin key contents to stdout")
                     (aliases: &["e", "ex", "exp", "expo", "expor"])
                     (@arg ORIGIN: +required +takes_value)
-                    (@arg PAIR_TYPE: -t --type +takes_value +required {valid_pair_type}
+                    (@arg PAIR_TYPE: -t --type +takes_value {valid_pair_type}
                     "Export either the `public' or `secret' key")
                 )
                 (@subcommand generate =>
@@ -137,7 +137,7 @@ pub fn get() -> App<'static, 'static> {
                 (aliases: &["bi", "bin", "binl", "binli", "binlin"])
                 (@arg PKG_IDENT: +required +takes_value
                     "A package identifier (ex: core/redis, core/busybox-static/1.42.2)")
-                (@arg BINARY: +required +takes_value
+                (@arg BINARY: +takes_value
                     "The command to symlink (ex: bash)")
                 (@arg DEST_DIR: -d --dest +takes_value
                     "Sets the destination directory (default: /bin)")
@@ -149,6 +149,11 @@ pub fn get() -> App<'static, 'static> {
                     "A package identifier (ex: core/redis, core/busybox-static/1.42.2)")
             )
             (subcommand: sub_pkg_build())
+            (@subcommand env =>
+                (about: "Prints the runtime environment of a specific installed package")
+                (@arg PKG_IDENT: +required +takes_value
+                    "A package identifier (ex: core/redis, core/busybox-static/1.42.2)")
+            )
             (@subcommand exec =>
                 (about: "Executes a command using the 'PATH' context of an installed package")
                 (aliases: &["exe"])
@@ -170,7 +175,7 @@ pub fn get() -> App<'static, 'static> {
             (@subcommand hash =>
                 (about: "Generates a blake2b hashsum from a target at any given filepath")
                 (aliases: &["ha", "has"])
-                (@arg SOURCE: +required {file_exists} "A filepath of the target")
+                (@arg SOURCE: +takes_value {file_exists} "A filepath of the target")
             )
             (subcommand: sub_pkg_install().aliases(
                 &["i", "in", "ins", "inst", "insta", "instal"]))
@@ -290,6 +295,35 @@ pub fn get() -> App<'static, 'static> {
                     (@arg ORG: "The service organization")
                 )
             )
+            (@subcommand load =>
+                (about: "Load a service to be started and supervised by Habitat from a package or \
+                    artifact. Services started in this manner will persist through Supervisor \
+                    restarts.")
+                (@setting Hidden)
+            )
+            (@subcommand unload =>
+                (about: "Unload a persistent or transient service started by the Habitat \
+                    supervisor. If the Supervisor is running when the service is unloaded the \
+                    service will be stopped.")
+                (@setting Hidden)
+            )
+            (@subcommand start =>
+                (about: "Start a loaded, but stopped, Habitat service or a transient service from \
+                    a package or artifact. If the Habitat Supervisor is not already running this \
+                    will additionally start one for you.")
+                (@setting Hidden)
+            )
+            (@subcommand stop =>
+                (about: "Stop a running Habitat service.")
+                (@setting Hidden)
+            )
+            (after_help: "\nALIASES:\
+                \n    load       Alias for: 'sup load'\
+                \n    unload     Alias for: 'sup unload'\
+                \n    start      Alias for: 'sup start'\
+                \n    stop       Alias for: 'sup stop'\
+                \n"
+            )
         )
         (@subcommand studio =>
             (about: "Commands relating to Habitat Studios")
@@ -352,8 +386,8 @@ fn sub_cli_completers() -> App<'static, 'static> {
     // bad value to clap.
 
     sub.arg(Arg::with_name("SHELL")
-        .help("The name of the shell you want to generate the command-completion. \
-                      Supported Shells: bash, fish, zsh, powershell")
+        .help("The name of the shell you want to generate the command-completion. Supported \
+               Shells: bash, fish, zsh, powershell")
         .short("s")
         .long("shell")
         .required(true)
@@ -416,10 +450,10 @@ fn sub_pkg_install() -> App<'static, 'static> {
         (@arg BINLINK: -b --binlink "Binlink all binaries from installed package(s)")
     );
     sub.arg(Arg::with_name("IGNORE_TARGET")
-        .help("Skips target validation for package installation.")
-        .short("i")
-        .long("ignore-target")
-        .hidden(true))
+                .help("Skips target validation for package installation.")
+                .short("i")
+                .long("ignore-target")
+                .hidden(true))
 }
 
 fn file_exists(val: String) -> result::Result<(), String> {

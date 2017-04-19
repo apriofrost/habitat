@@ -14,7 +14,7 @@
 
 pub mod binlink;
 pub mod build;
-pub mod config;
+pub mod env;
 pub mod exec;
 pub mod export;
 pub mod hash;

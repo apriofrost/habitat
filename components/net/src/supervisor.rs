@@ -92,9 +92,9 @@ impl<T> Supervisor<T>
         let mut worker = T::new(cfg);
         let init_state = self.init_state.clone();
         thread::spawn(move || {
-            let state = try!(worker.init(init_state));
-            worker.start(tx, state)
-        });
+                          let state = try!(worker.init(init_state));
+                          worker.start(tx, state)
+                      });
         if rx.recv().is_ok() {
             debug!("Worker[{}] ready", worker_id);
             self.workers.insert(worker_id, rx);

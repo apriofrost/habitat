@@ -24,6 +24,7 @@ extern crate crypto;
 #[macro_use]
 extern crate hyper;
 extern crate iron;
+extern crate iron_test;
 #[macro_use]
 extern crate lazy_static;
 extern crate libc;
@@ -42,6 +43,7 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
+extern crate tempfile;
 extern crate time;
 extern crate toml;
 extern crate unicase;
@@ -49,10 +51,10 @@ extern crate url;
 extern crate urlencoded;
 extern crate walkdir;
 extern crate zmq;
+extern crate uuid;
 
 pub mod config;
 pub mod error;
-pub mod data_store;
 pub mod doctor;
 pub mod server;
 
@@ -64,30 +66,26 @@ use std::path::{Path, PathBuf};
 
 use crypto::sha2::Sha256;
 use crypto::digest::Digest;
-use hab_core::package::{Identifiable, PackageArchive};
+use hab_core::package::{Identifiable, PackageArchive, PackageTarget};
 use hab_net::server::NetIdent;
 use iron::typemap;
 
-use data_store::DataStore;
-
-pub struct Depot {
+pub struct DepotUtil {
     pub config: Config,
-    pub datastore: DataStore,
 }
 
-impl Depot {
-    pub fn new(config: Config) -> Result<Depot> {
-        let datastore = try!(DataStore::open(&config));
-        Ok(Depot {
-            config: config,
-            datastore: datastore,
-        })
+impl DepotUtil {
+    pub fn new(config: Config) -> DepotUtil {
+        DepotUtil { config: config }
     }
 
     // Return a PackageArchive representing the given package. None is returned if the Depot
     // doesn't have an archive for the given package.
-    fn archive<T: Identifiable>(&self, ident: &T) -> Option<PackageArchive> {
-        let file = self.archive_path(ident);
+    fn archive<T: Identifiable>(&self,
+                                ident: &T,
+                                target: &PackageTarget)
+                                -> Option<PackageArchive> {
+        let file = self.archive_path(ident, target);
         match fs::metadata(&file) {
             Ok(_) => Some(PackageArchive::new(file)),
             Err(_) => None,
@@ -96,7 +94,7 @@ impl Depot {
 
     // Return a formatted string representing the filename of an archive for the given package
     // identifier pieces.
-    fn archive_path<T: Identifiable>(&self, ident: &T) -> PathBuf {
+    fn archive_path<T: Identifiable>(&self, ident: &T, target: &PackageTarget) -> PathBuf {
         let mut digest = Sha256::new();
         let mut output = [0; 64];
         digest.input_str(&ident.to_string());
@@ -109,24 +107,19 @@ impl Depot {
                           ident.name(),
                           ident.version().unwrap(),
                           ident.release().unwrap(),
-                          self.config.supported_target.architecture,
-                          self.config.supported_target.platform))
+                          target.architecture,
+                          target.platform))
     }
 
-    fn key_path(&self, key: &str, rev: &str) -> PathBuf {
+    // Return a formatted string representing the folder location for an archive.
+    fn archive_parent<T: Identifiable>(&self, ident: &T) -> PathBuf {
         let mut digest = Sha256::new();
         let mut output = [0; 64];
-        let key_with_rev = format!("{}-{}.pub", key, rev);
-        digest.input_str(&key_with_rev.to_string());
+        digest.input_str(&ident.to_string());
         digest.result(&mut output);
-        self.keys_path()
+        self.packages_path()
             .join(format!("{:x}", output[0]))
             .join(format!("{:x}", output[1]))
-            .join(format!("{}-{}.pub", key, rev))
-    }
-
-    fn keys_path(&self) -> PathBuf {
-        Path::new(&self.config.path).join("keys")
     }
 
     fn packages_path(&self) -> PathBuf {
@@ -134,8 +127,8 @@ impl Depot {
     }
 }
 
-impl typemap::Key for Depot {
+impl typemap::Key for DepotUtil {
     type Value = Self;
 }
 
-impl NetIdent for Depot {}
+impl NetIdent for DepotUtil {}

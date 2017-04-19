@@ -33,6 +33,8 @@ pub struct Publish {
     pub enabled: bool,
     /// URL to Depot API
     pub url: String,
+    /// Channel to publish to
+    pub channel: String,
 }
 
 impl Publish {
@@ -41,14 +43,23 @@ impl Publish {
             return true;
         }
 
-        debug!("post process: publish (url: {})", self.url);
+        debug!("post process: publish (url: {}, channel: {})",
+               self.url,
+               self.channel);
 
         // Things to solve right now
         // * Where do we get the token for authentication?
         // * Should the workers ask for a lease from the JobSrv?
         let client = depot_client::Client::new(&self.url, PRODUCT, VERSION, None).unwrap();
         if let Some(err) = client.x_put_package(archive, auth_token).err() {
-            error!("post processing error, ERR={:?}", err);
+            error!("post processing error uploading package, ERR={:?}", err);
+            return false;
+        };
+
+        if let Some(err) = client
+               .promote_package(archive, &self.channel, auth_token)
+               .err() {
+            error!("post processing error promoting package, ERR={:?}", err);
             return false;
         };
         true
@@ -58,8 +69,11 @@ impl Publish {
 impl Default for Publish {
     fn default() -> Self {
         Publish {
-            enabled: false,
+            enabled: hab_core::url::default_depot_publish()
+                .parse::<bool>()
+                .unwrap(),
             url: hab_core::url::default_depot_url(),
+            channel: hab_core::url::default_depot_channel(),
         }
     }
 }
@@ -71,6 +85,7 @@ impl ConfigFile for Publish {
         let mut cfg = Publish::default();
         try!(toml.parse_into("publish.enabled", &mut cfg.enabled));
         try!(toml.parse_into("publish.url", &mut cfg.url));
+        try!(toml.parse_into("publish.channel", &mut cfg.channel));
         Ok(cfg)
     }
 }
@@ -81,26 +96,30 @@ pub struct PostProcessor {
 
 impl PostProcessor {
     pub fn new(workspace: &Workspace) -> Self {
-        let parent_path = Path::new(workspace.job.get_project().get_plan_path()).parent().unwrap();
+        let parent_path = Path::new(workspace.job.get_project().get_plan_path())
+            .parent()
+            .unwrap();
         let file_path = workspace.src().join(parent_path.join(CONFIG_FILE));
 
         PostProcessor { config_path: file_path }
     }
 
     pub fn run(&mut self, archive: &mut PackageArchive, auth_token: &str) -> bool {
-        if !self.config_path.exists() {
-            debug!("no post processing config - skipping");
-            return true;
-        }
-
-        debug!("starting post processing");
-        let mut cfg = match Publish::from_file(&self.config_path) {
-            Ok(value) => value,
-            Err(e) => {
-                debug!("failed to parse config file! {:?}", e);
-                return false;
+        let mut cfg = if !self.config_path.exists() {
+            debug!("no post processing config - using defaults");
+            Publish::default()
+        } else {
+            debug!("using post processing config from builder.toml");
+            match Publish::from_file(&self.config_path) {
+                Ok(value) => value,
+                Err(e) => {
+                    debug!("failed to parse config file! {:?}", e);
+                    return false;
+                }
             }
         };
+
+        debug!("starting post processing");
         cfg.run(archive, auth_token)
     }
 }
@@ -117,6 +136,7 @@ mod tests {
         [publish]
         enabled = false
         url = "https://willem.habitat.sh/v1/depot"
+        channel = "unstable"
         "#;
 
         let root: toml::Value = config_toml.parse().unwrap();
@@ -124,5 +144,6 @@ mod tests {
 
         assert_eq!("https://willem.habitat.sh/v1/depot", cfg.url);
         assert_eq!(false, cfg.enabled);
+        assert_eq!("unstable", cfg.channel);
     }
 }

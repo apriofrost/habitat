@@ -6,13 +6,21 @@ $pkg_license = @("Apache-2.0")
 $pkg_source = "https://s3-us-west-2.amazonaws.com/habitat-win-deps/hab-win-deps.zip"
 $pkg_shasum="0a99b1e171ff1075cca139cf9f695685f7a04b122f1704f82f2b852561847710"
 $pkg_bin_dirs = @("bin")
-$pkg_build_deps = @("core/visual-cpp-redist-2013", "core/rust")
+$pkg_deps = @("core/powershell")
+$pkg_build_deps = @("core/visual-cpp-redist-2013", "core/rust", "core/cacerts")
 
 function Invoke-Prepare {
+    if($env:HAB_CARGO_TARGET_DIR) {
+        $env:CARGO_TARGET_DIR           = "$env:HAB_CARGO_TARGET_DIR"
+    }
+    else {
+        $env:CARGO_TARGET_DIR           = "$env:HAB_CACHE_SRC_PATH/$pkg_dirname"
+    }
+
+    $env:SSL_CERT_FILE              = "$(Get-HabPackagePath "cacerts")/ssl/certs/cacert.pem"
     $env:PLAN_VERSION               = "$pkg_version/$pkg_release"
-    $env:CARGO_TARGET_DIR           = "$HAB_CACHE_SRC_PATH/$pkg_dirname"
-    $env:LIB                        = "$HAB_CACHE_SRC_PATH/$pkg_dirname/lib"
-    $env:INCLUDE                    = "$HAB_CACHE_SRC_PATH/$pkg_dirname/include"
+    $env:LIB                        += ";$HAB_CACHE_SRC_PATH/$pkg_dirname/lib"
+    $env:INCLUDE                    += ";$HAB_CACHE_SRC_PATH/$pkg_dirname/include"
     $env:SODIUM_LIB_DIR             = "$HAB_CACHE_SRC_PATH/$pkg_dirname/lib"
     $env:LIBARCHIVE_INCLUDE_DIR     = "$HAB_CACHE_SRC_PATH/$pkg_dirname/include"
     $env:LIBARCHIVE_LIB_DIR         = "$HAB_CACHE_SRC_PATH/$pkg_dirname/lib"

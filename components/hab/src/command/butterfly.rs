@@ -22,7 +22,7 @@ pub fn start(ui: &mut UI, args: Vec<OsString>) -> Result<()> {
     inner::start(ui, args)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 mod inner {
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -63,7 +63,7 @@ mod inner {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod inner {
     use std::ffi::OsString;
 
@@ -73,15 +73,20 @@ mod inner {
 
     pub fn start(ui: &mut UI, args: Vec<OsString>) -> Result<()> {
         let mut args = args.iter();
-        let subcmd =
-            match (args.next().map(|a| a.to_string_lossy()).unwrap_or_default().as_ref(),
-                   args.next().map(|a| a.to_string_lossy()).unwrap_or_default().as_ref()) {
-                ("config", "apply") => "config apply",
-                ("config", _) => "config",
-                ("file", "upload") => "file upload",
-                ("file", _) => "file",
-                (_, _) => unreachable!(),
-            };
+        let subcmd = match (args.next()
+                                .map(|a| a.to_string_lossy())
+                                .unwrap_or_default()
+                                .as_ref(),
+                            args.next()
+                                .map(|a| a.to_string_lossy())
+                                .unwrap_or_default()
+                                .as_ref()) {
+            ("config", "apply") => "config apply",
+            ("config", _) => "config",
+            ("file", "upload") => "file upload",
+            ("file", _) => "file",
+            (_, _) => unreachable!(),
+        };
         try!(ui.warn(format!("Running `{}` on this operating system is not currently \
                               supported. Try running this command again on a 64-bit Linux \
                               operating system.",

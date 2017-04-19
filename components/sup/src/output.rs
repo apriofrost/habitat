@@ -120,7 +120,8 @@ impl<'a> fmt::Display for StructuredOutput<'a> {
                        "{}({})[{}]: {}",
                        preamble_color.paint(self.preamble),
                        White.bold().paint(self.logkey),
-                       White.underline()
+                       White
+                           .underline()
                            .paint(format!("{}:{}:{}", self.file, self.line, self.column)),
                        self.content)
             } else {

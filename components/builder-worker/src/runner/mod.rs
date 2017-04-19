@@ -70,15 +70,22 @@ impl Job {
         Job(job)
     }
 
-    pub fn vcs(&self) -> &vcs::RemoteSource {
-        if self.0.get_project().has_git() {
-            return self.0.get_project().get_git();
+    pub fn vcs(&self) -> vcs::VCS {
+        match self.0.get_project().get_vcs_type() {
+            "git" => {
+                vcs::VCS::new(String::from(self.0.get_project().get_vcs_type()),
+                              String::from(self.0.get_project().get_vcs_data()))
+            }
+            _ => panic!("unknown vcs associated with jobs project"),
         }
-        unreachable!("unknown vcs associated with job's project");
     }
 
     pub fn origin(&self) -> &str {
-        let items = self.0.get_project().get_id().split("/").collect::<Vec<&str>>();
+        let items = self.0
+            .get_project()
+            .get_name()
+            .split("/")
+            .collect::<Vec<&str>>();
         assert!(items.len() == 2,
                 format!("Invalid project identifier - {}",
                         self.0.get_project().get_id()));
@@ -137,10 +144,18 @@ impl Runner {
             error!("WORKSPACE SETUP ERR={:?}", err);
             return self.fail(net::err(ErrCode::WORKSPACE_SETUP, "wk:run:1"));
         }
-        match self.depot_cli.fetch_origin_secret_key(self.job().origin(), &self.auth_token) {
+
+        if self.auth_token.is_empty() {
+            warn!("WARNING: No auth token specified, will likely fail fetching secret key");
+        };
+
+        match self.depot_cli
+                  .fetch_origin_secret_key(self.job().origin(), &self.auth_token) {
             Ok(key) => {
                 let cache = crypto::default_cache_key_path(None);
-                match crypto::SigKeyPair::write_file_from_str(&key.body, &cache) {
+                let s: String = String::from_utf8(key.body).expect("Found invalid UTF-8");
+
+                match crypto::SigKeyPair::write_file_from_str(&s, &cache) {
                     Ok((pair, pair_type)) => {
                         debug!("Imported {} origin key {}.",
                                &pair_type,
@@ -193,8 +208,8 @@ impl Runner {
                         OsString::from(self.job().origin()),
                         OsString::from("build"),
                         OsString::from(Path::new(self.job().get_project().get_plan_path())
-                            .parent()
-                            .unwrap())];
+                                           .parent()
+                                           .unwrap())];
         let command = studio_cmd();
         debug!("building, cmd={:?}, args={:?}", command, args);
         let mut child = Command::new(command)
@@ -243,8 +258,8 @@ impl Runner {
                         OsString::from(self.workspace.studio()),
                         OsString::from("rm"),
                         OsString::from(Path::new(self.job().get_project().get_plan_path())
-                            .parent()
-                            .unwrap())];
+                                           .parent()
+                                           .unwrap())];
         let command = studio_cmd();
         debug!("removing studio, cmd={:?}, args={:?}", command, args);
         let mut child = Command::new(command)
@@ -340,9 +355,9 @@ impl RunnerMgr {
         let handle = thread::Builder::new()
             .name("runner".to_string())
             .spawn(move || {
-                let mut runner = Self::new(config).unwrap();
-                runner.run(tx).unwrap();
-            })
+                       let mut runner = Self::new(config).unwrap();
+                       runner.run(tx).unwrap();
+                   })
             .unwrap();
         match rx.recv() {
             Ok(()) => Ok(handle),
@@ -353,10 +368,10 @@ impl RunnerMgr {
     fn new(config: Arc<RwLock<Config>>) -> Result<Self> {
         let sock = try!((**ZMQ_CONTEXT).as_mut().socket(zmq::DEALER));
         Ok(RunnerMgr {
-            sock: sock,
-            msg: zmq::Message::new().unwrap(),
-            config: config,
-        })
+               sock: sock,
+               msg: zmq::Message::new().unwrap(),
+               config: config,
+           })
     }
 
     // Main loop for server
@@ -413,13 +428,13 @@ fn studio_cmd() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{jobsrv, vault};
+    use protocol::{jobsrv, originsrv};
 
     #[test]
     fn extract_origin_from_job() {
         let mut inner = jobsrv::Job::new();
-        let mut project = vault::Project::new();
-        project.set_id("core/nginx".to_string());
+        let mut project = originsrv::OriginProject::new();
+        project.set_name("core/nginx".to_string());
         inner.set_project(project);
         let job = Job::new(inner);
         assert_eq!(job.origin(), "core");

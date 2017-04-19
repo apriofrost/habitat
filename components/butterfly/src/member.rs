@@ -19,26 +19,36 @@ use std::fmt;
 use std::iter::IntoIterator;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
+use std::result;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use uuid::Uuid;
+use protobuf::ProtobufEnum;
 use rand::{thread_rng, Rng};
 use time::SteadyTime;
+use uuid::Uuid;
+use serde::{Serialize, Serializer};
+use serde::ser::SerializeStruct;
 
-use rumor::RumorKey;
 use message::swim::{Member as ProtoMember, Membership as ProtoMembership,
                     Membership_Health as ProtoMembership_Health, Rumor_Type};
+use rumor::RumorKey;
 
 /// How many nodes do we target when we need to run PingReq.
 const PINGREQ_TARGETS: usize = 5;
 
 /// The health of a node.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum Health {
     Alive,
     Suspect,
     Confirmed,
+}
+
+impl From<i32> for Health {
+    fn from(value: i32) -> Health {
+        Self::from(ProtoMembership_Health::from_i32(value).unwrap_or(ProtoMembership_Health::ALIVE))
+    }
 }
 
 /// Maps our internal health to the wire protocols health.
@@ -84,20 +94,12 @@ impl fmt::Display for Health {
 
 /// A member in the swim group. Passes most of its functionality along to the internal protobuf
 /// representation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Member {
     pub proto: ProtoMember,
 }
 
 impl Member {
-    /// Creates a new member with a unique UUID and an incarnation of zero.
-    pub fn new() -> Member {
-        let mut proto_member = ProtoMember::new();
-        proto_member.set_id(Uuid::new_v4().simple().to_string());
-        proto_member.set_incarnation(0);
-        Member { proto: proto_member }
-    }
-
     /// Returns the socket address of this member.
     ///
     /// # Panics
@@ -112,6 +114,15 @@ impl Member {
                 panic!("Cannot parse member {:?} address: {}", self, e);
             }
         }
+    }
+}
+
+impl Default for Member {
+    fn default() -> Self {
+        let mut proto_member = ProtoMember::new();
+        proto_member.set_id(Uuid::new_v4().simple().to_string());
+        proto_member.set_incarnation(0);
+        Member { proto: proto_member }
     }
 }
 
@@ -165,11 +176,32 @@ pub type UuidSimple = String;
 /// Tracks lists of members, their health, and how long they have been suspect.
 #[derive(Debug, Clone)]
 pub struct MemberList {
-    members: Arc<RwLock<HashMap<UuidSimple, Member>>>,
-    health: Arc<RwLock<HashMap<UuidSimple, Health>>>,
+    pub members: Arc<RwLock<HashMap<UuidSimple, Member>>>,
+    pub health: Arc<RwLock<HashMap<UuidSimple, Health>>>,
     suspect: Arc<RwLock<HashMap<UuidSimple, SteadyTime>>>,
     initial_members: Arc<RwLock<Vec<Member>>>,
     update_counter: Arc<AtomicUsize>,
+}
+
+impl Serialize for MemberList {
+    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error>
+        where S: Serializer
+    {
+        let mut strukt = try!(serializer.serialize_struct("member_list", 4));
+        {
+            let member_struct = self.members.read().expect("Member lock is poisoned");
+            try!(strukt.serialize_field("members", &*member_struct));
+        }
+        {
+            let health_struct = self.health.read().expect("Health lock is poisoned");
+            try!(strukt.serialize_field("health", &*health_struct));
+        }
+        {
+            let update_number = self.update_counter.load(Ordering::SeqCst);
+            try!(strukt.serialize_field("update_counter", &update_number));
+        }
+        strukt.end()
+    }
 }
 
 impl MemberList {
@@ -197,19 +229,25 @@ impl MemberList {
     }
 
     pub fn len_initial_members(&self) -> usize {
-        let im = self.initial_members.read().expect("Initial members lock is poisoned");
+        let im = self.initial_members
+            .read()
+            .expect("Initial members lock is poisoned");
         im.len()
     }
 
     pub fn add_initial_member(&self, member: Member) {
-        let mut im = self.initial_members.write().expect("Initial members lock is poisoned");
+        let mut im = self.initial_members
+            .write()
+            .expect("Initial members lock is poisoned");
         im.push(member);
     }
 
     pub fn with_initial_members<F>(&self, mut with_closure: F) -> ()
         where F: FnMut(&Member)
     {
-        let im = self.initial_members.read().expect("Initial members lock is poisoned");
+        let im = self.initial_members
+            .read()
+            .expect("Initial members lock is poisoned");
         for member in im.iter() {
             with_closure(member);
         }
@@ -285,7 +323,10 @@ impl MemberList {
                     .insert(String::from(member.get_id()), SteadyTime::now());
             }
             if stop_suspicion == true {
-                self.suspect.write().expect("Suspect lock is poisoned").remove(member.get_id());
+                self.suspect
+                    .write()
+                    .expect("Suspect lock is poisoned")
+                    .remove(member.get_id());
             }
             self.members
                 .write()
@@ -297,7 +338,10 @@ impl MemberList {
 
     /// Returns the health of the member, if the member exists.
     pub fn health_of(&self, member: &Member) -> Option<Health> {
-        match self.health.read().expect("Health lock is poisoned").get(member.get_id()) {
+        match self.health
+                  .read()
+                  .expect("Health lock is poisoned")
+                  .get(member.get_id()) {
             Some(health) => Some(health.clone()),
             None => None,
         }
@@ -305,7 +349,10 @@ impl MemberList {
 
     /// Returns the health of the member, if the member exists.
     pub fn health_of_by_id(&self, member_id: &str) -> Option<Health> {
-        match self.health.read().expect("Health lock is poisoned").get(member_id) {
+        match self.health
+                  .read()
+                  .expect("Health lock is poisoned")
+                  .get(member_id) {
             Some(health) => Some(health.clone()),
             None => None,
         }
@@ -313,7 +360,10 @@ impl MemberList {
 
     /// Returns true if the members health is the same as `health`. False otherwise.
     pub fn check_health_of(&self, member: &Member, health: Health) -> bool {
-        match self.health.read().expect("Health lock is poisoned").get(member.get_id()) {
+        match self.health
+                  .read()
+                  .expect("Health lock is poisoned")
+                  .get(member.get_id()) {
             Some(real_health) if *real_health == health => true,
             Some(_) => false,
             None => false,
@@ -322,7 +372,10 @@ impl MemberList {
 
     /// Returns true if the members health is the same as `health`. False otherwise.
     pub fn check_health_of_by_id(&self, member_id: &str, health: Health) -> bool {
-        match self.health.read().expect("Health lock is poisoned").get(member_id) {
+        match self.health
+                  .read()
+                  .expect("Health lock is poisoned")
+                  .get(member_id) {
             Some(real_health) if *real_health == health => true,
             Some(_) => false,
             None => false,
@@ -382,7 +435,9 @@ impl MemberList {
             .get(member_id)
             .expect("Should have membership before calling membership_for")
             .into();
-        let ml = self.members.read().expect("Member list lock is poisoned");
+        let ml = self.members
+            .read()
+            .expect("Member list lock is poisoned");
         let member = ml.get(member_id)
             .expect("Should have membership before calling membership_for");
         pm.set_health(mhealth);
@@ -392,7 +447,10 @@ impl MemberList {
 
     /// Returns the number of members.
     pub fn len(&self) -> usize {
-        self.members.read().expect("Member list lock is poisoned").len()
+        self.members
+            .read()
+            .expect("Member list lock is poisoned")
+            .len()
     }
 
     /// A randomized list of members to check.
@@ -419,17 +477,20 @@ impl MemberList {
     {
         // This will lead to nested read locks if you don't deal with making a copy
         let mut members: Vec<Member> = {
-            let ml = self.members.read().expect("Member list lock is poisoned");
+            let ml = self.members
+                .read()
+                .expect("Member list lock is poisoned");
             ml.values().map(|v| v.clone()).collect()
         };
         let mut rng = thread_rng();
         rng.shuffle(&mut members);
-        for member in members.into_iter()
-            .filter(|m| {
-                m.get_id() != sending_member_id && m.get_id() != target_member_id &&
-                self.check_health_of_by_id(m.get_id(), Health::Alive)
-            })
-            .take(PINGREQ_TARGETS) {
+        for member in members
+                .into_iter()
+                .filter(|m| {
+                            m.get_id() != sending_member_id && m.get_id() != target_member_id &&
+                            self.check_health_of_by_id(m.get_id(), Health::Alive)
+                        })
+                .take(PINGREQ_TARGETS) {
             with_closure(member);
         }
     }
@@ -439,14 +500,20 @@ impl MemberList {
     pub fn with_member_iter<F>(&self, mut with_closure: F) -> ()
         where F: FnMut(hash_map::Values<String, Member>) -> ()
     {
-        with_closure(self.members.read().expect("Member list lock is poisoned").values());
+        with_closure(self.members
+                         .read()
+                         .expect("Member list lock is poisoned")
+                         .values());
     }
 
     /// Takes a function whose argument is a reference to the member list hashmap.
     pub fn with_member_list<F>(&self, mut with_closure: F) -> ()
         where F: FnMut(&HashMap<String, Member>) -> ()
     {
-        with_closure(self.members.read().expect("Member list lock is poisoned").deref());
+        with_closure(self.members
+                         .read()
+                         .expect("Member list lock is poisoned")
+                         .deref());
     }
 
     /// Calls a function whose argument is a reference to a membership entry matching the given ID.
@@ -462,7 +529,10 @@ impl MemberList {
     pub fn with_members<F>(&self, mut with_closure: F) -> ()
         where F: FnMut(&Member) -> ()
     {
-        for member in self.members.read().expect("Member list lock is poisoned").values() {
+        for member in self.members
+                .read()
+                .expect("Member list lock is poisoned")
+                .values() {
             with_closure(member);
         }
     }
@@ -471,19 +541,27 @@ impl MemberList {
     pub fn with_suspects<F>(&self, mut with_closure: F) -> ()
         where F: FnMut((&str, &SteadyTime)) -> ()
     {
-        for (id, suspect) in self.suspect.read().expect("Suspect list lock is poisoned").iter() {
+        for (id, suspect) in self.suspect
+                .read()
+                .expect("Suspect list lock is poisoned")
+                .iter() {
             with_closure((id, suspect));
         }
     }
 
     /// Expires a member from the suspect list.
     pub fn expire(&self, member_id: &str) {
-        let mut suspects = self.suspect.write().expect("Suspect list lock is poisoned");
+        let mut suspects = self.suspect
+            .write()
+            .expect("Suspect list lock is poisoned");
         suspects.remove(member_id);
     }
 
     pub fn contains_member(&self, member_id: &str) -> bool {
-        self.members.read().expect("Member list lock is poisoned").contains_key(member_id)
+        self.members
+            .read()
+            .expect("Member list lock is poisoned")
+            .contains_key(member_id)
     }
 }
 
@@ -497,7 +575,7 @@ mod tests {
         // Sets the uuid to simple, and the incarnation to zero.
         #[test]
         fn new() {
-            let member = Member::new();
+            let member = Member::default();
             assert_eq!(member.proto.get_id().len(), 32);
             assert_eq!(member.proto.get_incarnation(), 0);
         }
@@ -521,7 +599,7 @@ mod tests {
         fn populated_member_list(size: u64) -> MemberList {
             let ml = MemberList::new();
             for _x in 0..size {
-                let m = Member::new();
+                let m = Member::default();
                 ml.insert(m, Health::Alive);
             }
             ml
@@ -612,7 +690,7 @@ mod tests {
         #[test]
         fn insert_no_member() {
             let ml = MemberList::new();
-            let member = Member::new();
+            let member = Member::default();
             let mcheck = member.clone();
             assert_eq!(ml.insert(member, Health::Alive), true);
             assert!(ml.check_health_of(&mcheck, Health::Alive));
@@ -621,7 +699,7 @@ mod tests {
         #[test]
         fn insert_existing_member_lower_incarnation() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let mut member_two = member_one.clone();
             member_two.set_incarnation(1);
@@ -638,7 +716,7 @@ mod tests {
         #[test]
         fn insert_existing_member_higher_incarnation() {
             let ml = MemberList::new();
-            let mut member_one = Member::new();
+            let mut member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -656,7 +734,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_alive_new_alive() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
 
@@ -669,7 +747,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_alive_new_suspect() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -684,7 +762,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_alive_new_confirmed() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -699,7 +777,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_suspect_new_alive() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -714,7 +792,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_suspect_new_suspect() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -729,7 +807,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_suspect_new_confirmed() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -744,7 +822,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_confirmed_new_alive() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -759,7 +837,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_confirmed_new_suspect() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();
@@ -774,7 +852,7 @@ mod tests {
         #[test]
         fn insert_equal_incarnation_current_confirmed_new_confirmed() {
             let ml = MemberList::new();
-            let member_one = Member::new();
+            let member_one = Member::default();
             let mcheck_one = member_one.clone();
             let member_two = member_one.clone();
             let mcheck_two = member_two.clone();

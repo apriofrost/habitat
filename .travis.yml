@@ -2,7 +2,9 @@ branches:
   only:
     - master
     - /^sentinel.+$/
+    - /^acceptance_deploy.+$/
     - /^test_development-.*$/
+    - /^\d+\.\d+\.\d+$/
 env:
   global:
     - PATH=$HOME/.cargo/bin:$PATH
@@ -33,7 +35,7 @@ matrix:
     - os: linux
       language: rust
       env:
-        - COMPONENTS=bin LIBSODIUM_PREFIX=$HOME/pkgs/libsodium/1.0.8 LIBARCHIVE_PREFIX=$HOME/pkgs/libarchive/3.2.0 LIBZMQ_PREFIX=$HOME/pkgs/zeromq/4.1.4 PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$LIBARCHIVE_PREFIX/lib/pkgconfig:$LIBSODIUM_PREFIX/lib/pkgconfig:$LIBZMQ_PREFIX/lib/pkgconfig" LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$LIBARCHIVE_PREFIX/lib:$LIBSODIUM_PREFIX/lib:$LIBZMQ_PREFIX/lib" LIBRARY_PATH="$LIBRARY_PATH:$LIBZMQ_PREFIX/lib"
+        - COMPONENTS=bin LIBSODIUM_PREFIX=$HOME/pkgs/libsodium/1.0.12 LIBARCHIVE_PREFIX=$HOME/pkgs/libarchive/3.2.0 LIBZMQ_PREFIX=$HOME/pkgs/zeromq/4.1.4 PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$LIBARCHIVE_PREFIX/lib/pkgconfig:$LIBSODIUM_PREFIX/lib/pkgconfig:$LIBZMQ_PREFIX/lib/pkgconfig" LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$LIBARCHIVE_PREFIX/lib:$LIBSODIUM_PREFIX/lib:$LIBZMQ_PREFIX/lib" LIBRARY_PATH="$LIBRARY_PATH:$LIBZMQ_PREFIX/lib"
         - AFFECTED_DIRS="components/hab|components/sup"
       rust: stable
       sudo: false
@@ -68,7 +70,7 @@ matrix:
     - os: linux
       language: rust
       env:
-        - COMPONENTS=lib LIBSODIUM_PREFIX=$HOME/pkgs/libsodium/1.0.8 LIBARCHIVE_PREFIX=$HOME/pkgs/libarchive/3.2.0 LIBZMQ_PREFIX=$HOME/pkgs/zeromq/4.1.4 PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$LIBARCHIVE_PREFIX/lib/pkgconfig:$LIBSODIUM_PREFIX/lib/pkgconfig:$LIBZMQ_PREFIX/lib/pkgconfig" LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$LIBARCHIVE_PREFIX/lib:$LIBSODIUM_PREFIX/lib:$LIBZMQ_PREFIX/lib" LIBRARY_PATH="$LIBRARY_PATH:$LIBZMQ_PREFIX/lib"
+        - COMPONENTS=lib LIBSODIUM_PREFIX=$HOME/pkgs/libsodium/1.0.12 LIBARCHIVE_PREFIX=$HOME/pkgs/libarchive/3.2.0 LIBZMQ_PREFIX=$HOME/pkgs/zeromq/4.1.4 PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$LIBARCHIVE_PREFIX/lib/pkgconfig:$LIBSODIUM_PREFIX/lib/pkgconfig:$LIBZMQ_PREFIX/lib/pkgconfig" LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$LIBARCHIVE_PREFIX/lib:$LIBSODIUM_PREFIX/lib:$LIBZMQ_PREFIX/lib" LIBRARY_PATH="$LIBRARY_PATH:$LIBZMQ_PREFIX/lib"
         - AFFECTED_DIRS="components/builder-dbcache|components/builder-core|components/builder-protocol|components/common|components/core|components/builder-depot-client|components/http-client|components/net|components/butterfly"
       rust: stable
       sudo: false
@@ -103,7 +105,7 @@ matrix:
     - os: linux
       language: rust
       env:
-        - COMPONENTS=srv LIBSODIUM_PREFIX=$HOME/pkgs/libsodium/1.0.8 LIBARCHIVE_PREFIX=$HOME/pkgs/libarchive/3.2.0 LIBZMQ_PREFIX=$HOME/pkgs/zeromq/4.1.4 PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$LIBARCHIVE_PREFIX/lib/pkgconfig:$LIBSODIUM_PREFIX/lib/pkgconfig:$LIBZMQ_PREFIX/lib/pkgconfig" LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$LIBARCHIVE_PREFIX/lib:$LIBSODIUM_PREFIX/lib:$LIBZMQ_PREFIX/lib" LIBRARY_PATH="$LIBRARY_PATH:$LIBZMQ_PREFIX/lib"
+        - COMPONENTS=srv LIBSODIUM_PREFIX=$HOME/pkgs/libsodium/1.0.12 LIBARCHIVE_PREFIX=$HOME/pkgs/libarchive/3.2.0 LIBZMQ_PREFIX=$HOME/pkgs/zeromq/4.1.4 PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$LIBARCHIVE_PREFIX/lib/pkgconfig:$LIBSODIUM_PREFIX/lib/pkgconfig:$LIBZMQ_PREFIX/lib/pkgconfig" LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$LIBARCHIVE_PREFIX/lib:$LIBSODIUM_PREFIX/lib:$LIBZMQ_PREFIX/lib" LIBRARY_PATH="$LIBRARY_PATH:$LIBZMQ_PREFIX/lib"
         - AFFECTED_DIRS="components/builder-api|components/builder-admin|components/builder-jobsrv|components/builder-sessionsrv|components/builder-vault|components/builder-worker|components/builder-depot"
       rust: stable
       sudo: required
@@ -175,6 +177,8 @@ matrix:
         - AWS_BUCKET=habitat-www
         - AWS_DEFAULT_REGION=us-west-2
         - AWS_ACCESS_KEY_ID=AKIAJ2XVYOYEVJT77NJQ
+        # NETLIFYKEY
+        - secure: "EyM8UThsqW8bFLzhUs/YeqDyGZh5dplgFkCs6Ps7hLx30BQArMy9PV8xVfvGfoWtLunw0TrBWd6vwmymF6Hf8Dv/p/qQgRD5m3OVSx50KJA7TTr42AhfKmfGfWaSQVYE8SayAiE+fPb4eHB85hekfpt2yawuRbUNyzCfmcic4sX+IIUBKHJih+6P+ovP9+aYXmo62VwEaLac0sOWB6n7wa57Y4vs/BIf4B3CjOUqAVpFxHdply+WcBCxuja3AQGyebofPpe7A+NdNoGgOSKiWgGL0ke7rW1/8r3icqQO0/MigOkvdZz8l/p19aeMcUR7NfDjTCKC8y4HbXIUltjHlatCiFPwjyqC9req/RTK7fYid7mOdQ6VEQD28oW0l4geEgwQltV6N/nsKmNX5JFvr7BhR3FKV3F7oA+bwUBBntxzPqkgSYOSwz4HnfZhTdJWtD0h1FYFU+rcHXw5JRTdoS0gA2wG22yXuROjOewPt0rIrrFHw8rj5T+457P55h33k4P+Ekx8W70TarSP0uweB646nGj62IHGXKrLS6VHwTeWxLwf9wdMx3c+JLrm4VPe0FHY642MlW2AERvDu9f48xGvwNUF9y+cIsGkghB1USYqs82tTW/oV9sAmRwoWPuBlT1mFf5RQe6HGXA/T7ThO/F7aKFWj8FZFG9BNNWDfq0="
         # AWS_SECRET_ACCESS_KEY
         - secure: "p9bQyftYcDPrmRpU3SUHj6xB/KH5jSiNqKoNMhXcQjasSV3nnPkGp18ZCKiRNO5WOMq8pX9mp6BENnHSj8WM9G8RxYK678fi+JIkTkrbtlcT8HAIRr4K3p0vD7y6G4xO3QuFbBY4FbD4WRdnrAQ1lgEQey5LHn5bGr95TDDVefN06ddDpE0wJE0/kBhC76ipZlmGuOwKmti1igvhmWHYWlYt7J4nFaTphpKi0NwrAtR2X5B+xnIhuy4I8dPBfYLA366acHMip/jvMf2v7JTSW5+WPIHDOTQy8cXvD4akokerGo+xMhClXoUNpBkdSW5arcyL8Zd4YWzsZHso4UXhMllU+fspPaZ6Lkz2Wor/oTWkqkMEAtX06Nxtb/47qjkoDAjHwoZrlrKqqVYE8/pYb6UAMJy/s92BD3dKKLitQ5ge62Sgc4wTl3p7aSDMbEDdzxBHfZPu+j2RmPkaTFeU4Zmuat1iSy5ca7Y+DvNk4Ryoh5Bt0oUs4MY4aviLY20g6VegfP/cbzdMhdUFjA36aVMOZ+4lK5sJoaYvyJFAAMJb2eLQQHcVkJ9v816K1R2EtuzggIBU6TRDZPsJfPMBd/LFBDaQzMX1BTO73Vd2Y8RK/DDDXDFMlW8xsC36UhvjKFEmixX3ZbC7I/CHuuok9eNnSB86xVMYU0iyXuC/wiY="
         # FASTLY_API_KEY
@@ -185,7 +189,10 @@ matrix:
       script: ./support/ci/deploy_website.sh
     - os: linux
       env:
-        - AFFECTED_DIRS="Cargo\.toml|Cargo\.lock|components/hab|components/common|components/core|components/builder-depot-client|components/http-client"
+        - COMPONENTS="sup hab-butterfly hab plan-build backline bintray-publish studio pkg-aci pkg-dockerize pkg-mesosize pkg-tarize"
+        - AFFECTED_DIRS="support/ci/deploy\.sh|Cargo\.toml|Cargo\.lock|components/hab|components/common|components/core|components/builder-depot-client|components/http-client|components/sup|components/hab-butterfly|components/butterfly"
+        # HAB_AUTH_TOKEN
+        - secure: "OCq9oDAEP3Cc0BiGrnZHE0FoNdyqsAy2LPTwEoOKvgiZdrw5o2bvpN1Kl+DKpw2auKtkeAS1aVSE/CMrglxrDs+VolvK9ttW3kj8c7+AeuCYjBsyWqdnZ1/24u6P+20fKanYrsMsnFb2r9OWwxZVlFnfmks81LWToOlGFJpL5KnmSPrB2vlWPbiaH9+yg8aslrmCq0reSoSVSnoZHoTolWtjzx2WdPYqA4gu0HHASVbH5qP+PoQSGIWvwbBaU4xhwkp1K8rWCjI8lre2YpBMOdfZv+9arMjc3Xg/kgD9oGU9DN7Q3UzAWxTSJv/3Cm4LArwiI57rXMLDKf8N1MhvGMHP1xgbuN8JWFKqFuWpqCf6qJkYG8+VZkruKYOo/2tXtBY4hpbR2abcWvYU/S9AQFHKGJQ2vcArnp5SKO+Oq/fNVneeHli4RbGMRQCMVq+X0SSC148F0zEVVwkNM5eq4askfc/2y4asySrH0MT/5T3yBp8fr3zXpnj82h2ytCZOUs0o+La9+wt5gSDUJHdY/BwSSPrgnKSp7ixslM/g7lMy3nAOs6qLql8/vW543CXBurCACWTqwKcy3/wRparTkmZcs1d7vUrbcfYv7XJzh0pw2P1hCjWD9BtkowbuLVo8K9ndPl2rbFY9XljqFXMTcHxp4ETeCc23azHCs+SYFb0="
         # HAB_ORIGIN_KEY
         - secure: "uZ70GE8qK3GBgs7ZIsoy5DhPlHNs2hoLxLBGKq+u+0XrE017pOnW6mNHsn7J7i2r8CPtd4KFsFEN52wZSA+Sf96MFIL2w9E+geykBgbRMZzv4icuCf0xSGwm4iRMgZ9A08TfurMX6y6N+4JNsrCv9syVNuGq09EL2wLHPXOQhesMpodijQLcFikxfEXXbaWla1xHnYxJk+fbvYDoXVCbdqnpdeLTmGuQHFaaNI7jm1B3L/dl+IGZxwFdvqBT3G9mHiXBdyi8bALs7rcZNdV7PqtFFpp98zIeqwNHtHPd5cBRmqDRTRxucRSACS/lurrz9J+001a9RjPvUkYlLrn0hQY9pN6oo+kCpN/1r0bc17i4FbGx7R73FnFgPK/cno0ENBFygNZn7/jg6cENgjkBlHsZhc1+L1xhILo46nQU9XbWJrwelVYUOOGXI76tECOkGhkglx1vYK8fcMVLJMhL7psgPpbGbDJQDuAKhHS+75txNK+356ompNL+YUzeWZc4KSGZCNTQsPK+rsGttmA+JXtAaquFaY5xwSgyKHwETiSVg4dYXb3xh6goNxf2JTOZOosWaypyykHqcqsqCu2fzIDdmkgCx6I5/5q8I/7Z0es0jlUpHamlihZwe4E5YdYFCSouaDoeTnVdJKVI1p9fnAjpFqjivFgqLE/Z504vCNU="
         - BINTRAY_USER=smurawski
@@ -194,6 +201,8 @@ matrix:
         # BINTRAY_PASSPHRASE
         - secure: "XkZuLadu8aGACYdDN9QLUvuuGciiC8PahELGn2gfI8ILeIozzsWCclmNp2eKfduYsAu0otdps2dHAI1VwYH6+xGq+6byMMpXaXbQl3fahMe2vwaREpstmjbglWMNHcBqH4Bccx3aMxZjROO6NeT1U49uk7lKW+Enf+Dhw90L8sVP3v/xbmynYnue32heeQklkNH57RZ3uWJOUOPxOn5vcXsI0PqvJ8i53qIiUDQLivjLmOJUuudQiU/WP6rpewiIMoPO/REfyxq3gkCcYkzeXxytpVLEFwWjS6mvpLQbTJ+8/tp06sLXBxqknFboEWsqcraswROXi4ZXpubraFFNO/9jn9c1RaSmJqBEIQEK0/4K5VDYjukWMWpMQcwGq/I5dqUaDZJpoWPGqvw9b3zgsZNjlvLq2FEeuQEj2eD2Z4S5/PpgQRFhJMS+uMdPpingQMQAn9y83bZeDdtakWcX/IRjMBSF+UXCaXfTF9SWwURsCqakMEQhtZ+A3g5MAtZ6N/2QMsUcI7K56PjxXJiRSnZw821+VJgkpbk8Z8M2koZ6+Jy4jOGrUvDVGZ8umj3ipNmX8nFjP2s8jS7ihfIuG33p1fNw2397dEf0pDnPdsCnT/43c1RgTunpjla8486GirOApl/P8B0VXimwrquhkXxVItOYHX+O400UtC6C7MQ="
       sudo: required
+      services:
+        - docker
       addons:
         apt:
           packages:
@@ -202,15 +211,17 @@ matrix:
           - wget
       cache:
         apt: true
+        cargo: true
         directories:
           - /root/travis_bootstrap
           - /hab/studios/home--travis--build--habitat-sh
           - /root/.cargo
       before_install:
         - ./support/ci/fast_pass.sh || exit 0
-        - if [[ ! -x ./support/ci/deploy_unstable.sh ]]; then chmod +x ./support/ci/deploy_unstable.sh; fi
+        - if [[ ! -x ./support/ci/deploy.sh ]]; then chmod +x ./support/ci/deploy.sh; fi
+        - openssl aes-256-cbc -K $encrypted_50e90ce07941_key -iv $encrypted_50e90ce07941_iv -in ./support/ci/habitat-srv-admin.enc -out /tmp/habitat-srv-admin -d
       script:
-        - sudo ./support/ci/deploy_unstable.sh
+        - sudo ./support/ci/deploy.sh
 notifications:
   webhooks:
     urls:

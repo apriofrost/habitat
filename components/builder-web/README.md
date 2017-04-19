@@ -4,15 +4,7 @@ This is the web application for the Habitat SaaS.
 
 This is a single page app built using [Angular 2](https://angular.io/).
 
-## Development
-
-The stable LTS version of Node must be installed (specified in [.nvmrc](.nvmrc).
-
-Run `npm install` to install dependencies.
-
-To run a development web server, run `npm start`.
-
-### Configuration
+## Configuration
 
 Copy habitat.conf.sample.js to habitat.conf.js to enable runtime configuration
 in development.
@@ -21,10 +13,77 @@ The configuration file looks like:
 
 ```js
 habitatConfig({
-    habitat_api_url: "https://my-api-url:1234/v1",
-    some_other-config_option: true,
+    habitat_api_url: "http://localhost:9636/v1",
+    community_url: "https://www.habitat.sh/community",
+    docs_url: "https://www.habitat.sh/docs",
+    environment: "production",
+    github_client_id: "0c2f738a7d0bd300de10",
+    source_code_url: "https://github.com/habitat-sh/habitat",
+    tutorials_url: "https://www.habitat.sh/tutorials",
+    version: "",
+    www_url: "https://www.habitat.sh",
 });
 ```
+
+## Installing Node
+
+The stable LTS version of Node must be installed (specified in [.nvmrc](.nvmrc)). You can use nvm (Node Version Manager) to install the desired version:
+
+```
+curl -o- https://raw.githubusercontent.com/creationix/nvm/v0.33.1/install.sh | bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+nvm install $(cat .nvmrc)
+```
+
+## Github OAuth
+
+By default, `builder-web` is configured to use a preconfigured dev github oauth application. This should suffice as long as you intend to use `http://localhost:3000` as the homepage. If you need to use an alternate host name or port, you will need to setup a separate oauth application and configure `builder-api` and `builder-sessionsrv` with its generated credentials.
+
+To register a new oauth application, go to your github user account settings and navigate to `OAuth Applications` and then click on `Register a new application`.
+
+It is important that the homepage is set to `http://<hostname>:<port>` and the Authorization callback URL is set to `http://<hostname>:<port>/#/sign-in`.
+
+Set the `github_client_id` to the client ID assigned to the oauth application. If you are running the API services, add `config.toml` files for the `builder-sessionsrv` and `builder-api` services:
+
+```
+mkdir -p /hab/svc/hab-builder-api
+mkdir -p /hab/svc/hab-builder-sessionsrv
+
+cat <<-EOF > /hab/svc/hab-builder-api/config.toml
+[cfg.github]
+client_id       = "<Client ID>"
+client_secret   = "<Client Sescret>"
+EOF
+
+cat <<-EOF > /hab/svc/hab-builder-sessionsrv/config.toml
+[cfg.github]
+client_id       = "<Client ID>"
+client_secret   = "<Client Sescret>"
+EOF
+```
+
+## Running the builder-api services
+
+If you want a full depot and api services to run along with the website, you can start these services by running `make bldr-run`. Note that `make bldr-run` includes running the `builder-web` service so you can skip the `npm` commands below.
+
+## Running `builder-web` server
+
+To start the node web server:
+
+```
+npm install
+npm start
+```
+
+The service can be reached at `http://localhost:3000` by default. This can be changed by exporting the `URL` environment variable with the value of the endpoint you want to run prior to running `npm start`:
+
+```
+export URL=http://123.45.7.8:5656
+```
+
+Remember to adjust your `habitat.conf.js` and oath application settings if you change the default endpoint.
 
 ### Tests
 
@@ -36,25 +95,10 @@ Run the unit tests with `npm run test-unit`. They also run in the background
 when running `npm start`.
 
 Files ending with .test.ts are unit tested. We use
-[Karma](https://karma-runner.github.io/0.13/index.html),
-[Mocha](https://mochajs.org/), and [Chai](http://chaijs.com/).
+[Karma](https://karma-runner.github.io/0.13/index.html) and
+[Jasmine](https://jasmine.github.io/).
 
 See [app/util.test.ts](app/util.test.ts) for an example.
-
-#### End-to-end Tests
-
-*THESE DO NOT PASS AND NEED TO BE REMOVED OR FIXED.*
-
-Run the end-to-end tests with `npm run test-e2e`.
-
-Files ending with .test.ts in the test/e2e directory are tested. We use
-[Protractor](https://angular.github.io/protractor/#/),
-[Mocha](https://mochajs.org/), and [Chai](http://chaijs.com/).
-
-It uses Chrome WebDriver, so Google Chrome must be installed to run the tests.
-
-By default it uses http://localhost:3000 for the URL, but you can change this
-by setting the `URL` environment variable to something else.
 
 ### Tasks
 
@@ -69,7 +113,6 @@ TASK_NAME`.
 * `clean`: Remove files created by build tasks
 * `clean-css`
 * `clean-js`
-* `format-js`: Autoformat TypeScript files with [`tsfmt`](https://github.com/vvakame/typescript-formatter)
 * `lint`: Check TS and SCSS files for lint errors
 * `lint-css`
 * `lint-css-watch`
@@ -88,9 +131,9 @@ TASK_NAME`.
 These are guidelines for how to structure and format code in the application.
 
 * Four spaces for tabs.
-* `npm run format-js` will run `tsfmt` to automatically format your code.
-* TypeScript is linted with [TSLint](http://palantir.github.io/tslint/). The
-  rules followed in this repository are in the [tslint.json](tslint.json) file.
+* TypeScript is linted with [TSLint](http://palantir.github.io/tslint/) using
+  additional rules from the [Angular Style Guide](https://angular.io/styleguide).
+  The rules followed in this repository are in the [tslint.json](tslint.json) file.
   Check your code with `npm run lint-js`.
 * SCSS is linted with [Sass Lint](https://github.com/sasstools/sass-lint). The
   rules followed in this repository are in the [.sass-lint.yml](.sass-lint.yml)

@@ -23,9 +23,10 @@ use libarchive::reader::{self, Reader};
 use libarchive::archive::{Entry, ReadFilter, ReadFormat, ExtractOption, ExtractOptions};
 use regex::Regex;
 
+use super::{Identifiable, PackageIdent, PackageTarget};
+use super::metadata::MetaFile;
 use error::{Error, Result};
 use crypto::{artifact, hash};
-use package::{Identifiable, PackageIdent, PackageTarget, MetaFile};
 
 lazy_static! {
     static ref METAFILE_REGXS: HashMap<MetaFile, Regex> = {
@@ -190,7 +191,11 @@ impl PackageArchive {
 
     /// A plain string representation of the archive's file name.
     pub fn file_name(&self) -> String {
-        self.path.file_name().unwrap().to_string_lossy().into_owned()
+        self.path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Given a package name and a path to a file as an `&str`, verify

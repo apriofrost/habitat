@@ -126,10 +126,10 @@ impl Server {
         let router = try!(RouteConn::new(Self::net_ident(), (**ZMQ_CONTEXT).as_mut()));
         let be = try!((**ZMQ_CONTEXT).as_mut().socket(zmq::DEALER));
         Ok(Server {
-            config: Arc::new(RwLock::new(config)),
-            router: router,
-            be_sock: be,
-        })
+               config: Arc::new(RwLock::new(config)),
+               router: router,
+               be_sock: be,
+           })
     }
 
     pub fn reconfigure(&self, config: Config) -> Result<()> {
@@ -162,6 +162,7 @@ impl Application for Server {
         let worker_mgr = try!(WorkerMgr::start(cfg2, ds2));
         try!(sup.start());
         try!(self.connect());
+        info!("builder-jobsrv is ready to go.");
         try!(zmq::proxy(&mut self.router.socket, &mut self.be_sock));
         worker_mgr.join().unwrap();
         Ok(())

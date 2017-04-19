@@ -23,6 +23,7 @@ use depot_client;
 use common;
 use hcore;
 use handlebars;
+use toml;
 
 pub type Result<T> = result::Result<T, Error>;
 
@@ -51,7 +52,8 @@ pub enum Error {
     RootRequired,
     SubcommandNotSupported(String),
     UnsupportedExportFormat(String),
-    TomlError,
+    TomlDeserializeError(toml::de::Error),
+    TomlSerializeError(toml::ser::Error),
     Utf8Error(String),
 }
 
@@ -67,9 +69,7 @@ impl fmt::Display for Error {
             }
             Error::CryptoCLI(ref e) => format!("{}", e),
             Error::DepotClient(ref err) => format!("{}", err),
-            Error::DockerDaemonDown => {
-                format!("Can not connect to Docker. Is the Docker daemon running?")
-            }
+            Error::DockerDaemonDown => format!("Can not connect to Docker. Is the Docker daemon running?"),
             #[cfg(not(windows))]
             Error::DockerFileSharingNotEnabled => {
                 format!("File Sharing must be enabled in order to enter a studio.\nPlease enable \
@@ -116,7 +116,8 @@ impl fmt::Display for Error {
                 format!("Subcommand `{}' not supported on this operating system", e)
             }
             Error::UnsupportedExportFormat(ref e) => format!("Unsupported export format: {}", e),
-            Error::TomlError => format!("Invalid TOML"),
+            Error::TomlDeserializeError(ref e) => format!("Can't deserialize TOML: {}", e),
+            Error::TomlSerializeError(ref e) => format!("Can't serialize TOML: {}", e),
             Error::Utf8Error(ref e) => format!("Error processing a string as UTF-8: {}", e),
         };
         write!(f, "{}", msg)
@@ -128,9 +129,7 @@ impl error::Error for Error {
         match *self {
             Error::ArgumentError(_) => "There was an error parsing an error or with it's value",
             Error::ButterflyError(_) => "Butterfly has had an error",
-            Error::CommandNotFoundInPkg(_) => {
-                "Command was not found under any 'PATH' directories in the package"
-            }
+            Error::CommandNotFoundInPkg(_) => "Command was not found under any 'PATH' directories in the package",
             Error::CryptoCLI(_) => "A cryptographic error has occurred",
             Error::DepotClient(ref err) => err.description(),
             Error::DockerDaemonDown => "The Docker daemon could not be found.",
@@ -144,19 +143,14 @@ impl error::Error for Error {
             Error::HabitatCore(ref err) => err.description(),
             Error::HandlebarsRenderError(ref err) => err.description(),
             Error::IO(ref err) => err.description(),
-            Error::PackageArchiveMalformed(_) => {
-                "Package archive was unreadable or had unexpected contents"
-            }
+            Error::PackageArchiveMalformed(_) => "Package archive was unreadable or had unexpected contents",
             Error::PathPrefixError(ref err) => err.description(),
-            Error::ProvidesError(_) => {
-                "Can't find a package that provides the given search parameter"
-            }
-            Error::RootRequired => {
-                "Root or administrator permissions required to complete operation"
-            }
+            Error::ProvidesError(_) => "Can't find a package that provides the given search parameter",
+            Error::RootRequired => "Root or administrator permissions required to complete operation",
             Error::SubcommandNotSupported(_) => "Subcommand not supported on this operating system",
             Error::UnsupportedExportFormat(_) => "Unsupported export format",
-            Error::TomlError => "Invalid TOML",
+            Error::TomlDeserializeError(_) => "Can't deserialize TOML",
+            Error::TomlSerializeError(_) => "Can't serialize TOML",
             Error::Utf8Error(_) => "Error processing string as UTF-8",
         }
     }
@@ -201,5 +195,16 @@ impl From<io::Error> for Error {
 impl From<path::StripPrefixError> for Error {
     fn from(err: path::StripPrefixError) -> Error {
         Error::PathPrefixError(err)
+    }
+}
+
+impl From<toml::de::Error> for Error {
+    fn from(err: toml::de::Error) -> Self {
+        Error::TomlDeserializeError(err)
+    }
+}
+impl From<toml::ser::Error> for Error {
+    fn from(err: toml::ser::Error) -> Self {
+        Error::TomlSerializeError(err)
     }
 }

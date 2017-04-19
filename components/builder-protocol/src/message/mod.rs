@@ -19,12 +19,12 @@ use protobuf;
 
 use sharding::InstaId;
 
-pub mod depotsrv;
 pub mod jobsrv;
 pub mod net;
 pub mod routesrv;
 pub mod sessionsrv;
-pub mod vault;
+pub mod originsrv;
+pub mod scheduler;
 
 #[derive(Debug)]
 pub struct Message<'a, T: 'a + protobuf::Message>(&'a T);
@@ -40,7 +40,8 @@ impl<'a, T: 'a + protobuf::Message> Message<'a, T> {
             Some("net") => net::Protocol::Net,
             Some("routesrv") => net::Protocol::RouteSrv,
             Some("sessionsrv") => net::Protocol::SessionSrv,
-            Some("vault") => net::Protocol::VaultSrv,
+            Some("originsrv") => net::Protocol::OriginSrv,
+            Some("scheduler") => net::Protocol::Scheduler,
             Some(_) | None => {
                 unreachable!("no protocol defined for message, name={}",
                              self.0.descriptor().full_name())
@@ -75,7 +76,10 @@ impl<'a, T: 'a + protobuf::Message> MessageBuilder<'a, T> {
 
     pub fn build(self) -> ::net::Msg {
         let mut msg = net::Msg::new();
-        msg.set_body(self.msg.0.write_to_bytes().unwrap());
+        msg.set_body(self.msg
+                         .0
+                         .write_to_bytes()
+                         .expect("All message fields have been set"));
         msg.set_message_id(self.msg.0.descriptor().name().to_string());
         if let Some(route_info) = self.route_info {
             msg.set_route_info(route_info);
@@ -152,7 +156,9 @@ mod tests {
                    net::Protocol::RouteSrv);
         assert_eq!(Message(&sessionsrv::Session::new()).protocol(),
                    net::Protocol::SessionSrv);
-        assert_eq!(Message(&vault::Origin::new()).protocol(),
-                   net::Protocol::VaultSrv);
+        assert_eq!(Message(&originsrv::Origin::new()).protocol(),
+                   net::Protocol::OriginSrv);
+        assert_eq!(Message(&scheduler::GroupCreate::new()).protocol(),
+                   net::Protocol::Scheduler);
     }
 }

@@ -16,19 +16,12 @@ import {Subscription} from "rxjs/Subscription";
 import {AppStore} from "./AppStore";
 import {Component, OnInit, OnDestroy} from "@angular/core";
 import {Router, RouterOutlet} from "@angular/router";
-import {FooterComponent} from "./footer/FooterComponent";
-import {HeaderComponent} from "./header/HeaderComponent";
-import {NotificationsComponent} from "./notifications/NotificationsComponent";
-import {SideNavComponent} from "./side-nav/SideNavComponent";
 import {authenticateWithGitHub, loadSessionState, removeNotification,
     requestGitHubAuthToken, routeChange, setGitHubAuthState,
     setPackagesSearchQuery, signOut, toggleUserNavMenu, loadFeatureFlags} from "./actions/index";
 
 @Component({
-    directives: [FooterComponent, HeaderComponent, NotificationsComponent,
-        RouterOutlet, SideNavComponent],
-    providers: [AppStore],
-    selector: "hab",
+    selector: "hab-app",
     template: `
     <div id="main-nav">
         <hab-notifications [notifications]="state.notifications.all"
@@ -65,9 +58,10 @@ export class AppComponent implements OnInit, OnDestroy {
         // Whenever the Angular route has an event, dispatch an event with the new
         // route data.
         this.sub = this.router.events.subscribe(event => {
+            let eventName = event.toString();
             // Don't show the side nav on the Sign In screen
-            this.hideNav = event.url.indexOf("sign-in") !== -1;
-            store.dispatch(routeChange(event.url));
+            this.hideNav = eventName.indexOf("sign-in") !== -1;
+            store.dispatch(routeChange(eventName));
             // Clear the package search when the route changes
             store.dispatch(setPackagesSearchQuery(""));
         });

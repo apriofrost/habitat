@@ -232,7 +232,7 @@ impl SymKey {
             Ok(msg) => Ok(msg),
             Err(_) => {
                 Err(Error::CryptoError("Secret key and nonce could not decrypt ciphertext"
-                    .to_string()))
+                                           .to_string()))
             }
         }
     }
@@ -443,7 +443,10 @@ mod test {
             Ok(_) => assert!(true),
             Err(_) => panic!("Generated pair should have a secret key"),
         }
-        assert!(cache.path().join(format!("{}.sym.key", pair.name_with_rev())).exists());
+        assert!(cache
+                    .path()
+                    .join(format!("{}.sym.key", pair.name_with_rev()))
+                    .exists());
     }
 
     #[test]
@@ -536,7 +539,7 @@ mod test {
         let cache = TempDir::new("key_cache").unwrap();
         fs::copy(fixture(&format!("keys/{}", VALID_KEY)),
                  cache.path().join(VALID_KEY))
-            .unwrap();
+                .unwrap();
 
         let result = SymKey::get_secret_key_path(VALID_NAME_WITH_REV, cache.path()).unwrap();
         assert_eq!(result, cache.path().join(VALID_KEY));
@@ -585,7 +588,8 @@ mod test {
         let pair = SymKey::generate_pair_for_ring("beyonce", cache.path()).unwrap();
 
         let (_, ciphertext) = pair.encrypt("Ringonit".as_bytes()).unwrap();
-        pair.decrypt("crazyinlove".as_bytes(), &ciphertext).unwrap();
+        pair.decrypt("crazyinlove".as_bytes(), &ciphertext)
+            .unwrap();
     }
 
     #[test]
@@ -613,7 +617,9 @@ mod test {
         let new_content = {
             let mut new_content_file = File::open(new_key_file).unwrap();
             let mut new_content = String::new();
-            new_content_file.read_to_string(&mut new_content).unwrap();
+            new_content_file
+                .read_to_string(&mut new_content)
+                .unwrap();
             new_content
         };
 
@@ -674,11 +680,13 @@ mod test {
         let cache = TempDir::new("key_cache").unwrap();
         let key = fixture("keys/ring-key-valid-20160504220722.sym.key");
         fs::copy(key,
-                 cache.path().join("ring-key-valid-20160504220722.sym.key"))
-            .unwrap();
+                 cache
+                     .path()
+                     .join("ring-key-valid-20160504220722.sym.key"))
+                .unwrap();
 
         SymKey::write_file_from_str("SYM-SEC-1\nring-key-valid-20160504220722\n\nsomething",
                                     cache.path())
-            .unwrap();
+                .unwrap();
     }
 }

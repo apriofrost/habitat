@@ -20,52 +20,27 @@
 //!
 //! See the [Config](struct.Config.html) struct for the specific options available.
 
+use std::fmt;
 use std::io;
-use std::mem;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, SocketAddr, SocketAddrV4};
 use std::ops::{Deref, DerefMut};
 use std::option;
+use std::result;
 use std::str::FromStr;
-use std::sync::{Once, ONCE_INIT};
-
-use hcore::package::PackageIdent;
 
 use error::{Error, Result, SupError};
-use http_gateway;
-use manager::service::{Topology, UpdateStrategy};
+
+pub const GOSSIP_DEFAULT_PORT: u16 = 9638;
 
 static LOGKEY: &'static str = "CFG";
-
-/// The Static Global Configuration.
-///
-/// This sets up a raw pointer, which we are going to transmute to a Box<Config>
-/// with the first call to gcache().
-static mut CONFIG: *const Config = 0 as *const Config;
-
-/// Store a configuration, for later use through `gconfig()`.
-///
-/// MUST BE CALLED BEFORE ANY CALLS TO `gconfig()`.
-pub fn gcache(config: Config) {
-    static ONCE: Once = ONCE_INIT;
-    unsafe {
-        ONCE.call_once(|| { CONFIG = mem::transmute(Box::new(config)); });
-    }
-}
-
-/// Return a reference to our cached configuration.
-///
-/// This is unsafe, because we are de-referencing the raw pointer stored in
-/// CONFIG.
-pub fn gconfig() -> &'static Config {
-    unsafe { &*CONFIG }
-}
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct GossipListenAddr(SocketAddr);
 
 impl Default for GossipListenAddr {
     fn default() -> GossipListenAddr {
-        GossipListenAddr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 9638)))
+        GossipListenAddr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0),
+                                                          GOSSIP_DEFAULT_PORT)))
     }
 }
 
@@ -111,203 +86,8 @@ impl ToSocketAddrs for GossipListenAddr {
     }
 }
 
-/// Holds our configuration options.
-#[derive(Default, Debug, PartialEq, Eq)]
-pub struct Config {
-    pub http_listen_addr: http_gateway::ListenAddr,
-    pub gossip_listen: GossipListenAddr,
-    package: PackageIdent,
-    local_artifact: Option<String>,
-    url: String,
-    topology: Topology,
-    group: String,
-    bind: Vec<String>,
-    gossip_peer: Vec<String>,
-    gossip_permanent: bool,
-    update_strategy: UpdateStrategy,
-    organization: Option<String>,
-    ring: Option<String>,
-    config_from: Option<String>,
-}
-
-impl Config {
-    /// Create a default `Config`
-    pub fn new() -> Config {
-        Config::default()
-    }
-
-    /// Set the config file from directory
-    pub fn set_config_from(&mut self, config_from: Option<String>) -> &mut Config {
-        self.config_from = config_from;
-        self
-    }
-
-    /// Return the config file from directory
-    pub fn config_from(&self) -> Option<&String> {
-        self.config_from.as_ref()
-    }
-
-    pub fn set_update_strategy(&mut self, strat: UpdateStrategy) -> &mut Config {
-        self.update_strategy = strat;
-        self
-    }
-
-    /// Return the command we used
-    pub fn update_strategy(&self) -> UpdateStrategy {
-        self.update_strategy
-    }
-
-    /// Set the group
-    pub fn set_group(&mut self, group: String) -> &mut Config {
-        self.group = group;
-        self
-    }
-
-    /// Return the group
-    pub fn group(&self) -> &str {
-        &self.group
-    }
-
-    /// Set the bindings
-    pub fn set_bind(&mut self, bind: Vec<String>) -> &mut Config {
-        self.bind = bind;
-        self
-    }
-
-    /// Return the bindings
-    pub fn bind(&self) -> Vec<String> {
-        self.bind.clone()
-    }
-
-    /// Set the url
-    pub fn set_url(&mut self, url: String) -> &mut Config {
-        self.url = url;
-        self
-    }
-
-    /// Return the url
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// Set the topology
-    pub fn set_topology(&mut self, topology: Topology) -> &mut Config {
-        self.topology = topology;
-        self
-    }
-
-    /// Return the topology
-    pub fn topology(&self) -> Topology {
-        self.topology
-    }
-
-    pub fn gossip_listen(&self) -> &GossipListenAddr {
-        &self.gossip_listen
-    }
-
-    pub fn set_gossip_listen(&mut self, gossip_listen: GossipListenAddr) -> &mut Config {
-        self.gossip_listen = gossip_listen;
-        self
-    }
-
-    pub fn http_listen_addr(&self) -> &SocketAddr {
-        &self.http_listen_addr
-    }
-
-    pub fn set_http_listen_ip(&mut self, ip: IpAddr) -> &mut Config {
-        self.http_listen_addr.set_ip(ip);
-        self
-    }
-
-    pub fn set_http_listen_port(&mut self, port: u16) -> &mut Config {
-        self.http_listen_addr.set_port(port);
-        self
-    }
-
-    pub fn gossip_permanent(&self) -> bool {
-        self.gossip_permanent
-    }
-
-    pub fn set_gossip_permanent(&mut self, p: bool) -> &mut Config {
-        self.gossip_permanent = p;
-        self
-    }
-
-    pub fn gossip_peer(&self) -> &[String] {
-        &self.gossip_peer
-    }
-
-    pub fn set_gossip_peer(&mut self, mut gp: Vec<String>) -> &mut Config {
-        for p in gp.iter_mut() {
-            if p.find(':').is_none() {
-                p.push_str(&format!(":{}", 9638));
-            }
-        }
-        self.gossip_peer = gp;
-        self
-    }
-
-    pub fn set_package(&mut self, ident: PackageIdent) -> &mut Config {
-        self.package = ident;
-        self
-    }
-
-    pub fn package(&self) -> &PackageIdent {
-        &self.package
-    }
-
-    pub fn set_local_artifact(&mut self, artifact: String) -> &mut Config {
-        self.local_artifact = Some(artifact);
-        self
-    }
-
-    pub fn local_artifact(&self) -> Option<&str> {
-        self.local_artifact.as_ref().map(String::as_ref)
-    }
-
-    pub fn set_organization(&mut self, org: String) -> &mut Config {
-        self.organization = Some(org);
-        self
-    }
-
-    pub fn organization(&self) -> Option<&str> {
-        self.organization.as_ref().map(|v| &**v)
-    }
-
-    /// Set the ring name
-    pub fn set_ring(&mut self, ring: String) -> &mut Config {
-        self.ring = Some(ring);
-        self
-    }
-
-    /// Return the ring name
-    pub fn ring(&self) -> Option<&str> {
-        self.ring.as_ref().map(|v| &**v)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use manager::service::Topology;
-    use super::Config;
-
-    #[test]
-    fn new() {
-        let c = Config::new();
-        assert_eq!(c.topology(), Topology::Standalone);
-    }
-
-    #[test]
-    fn url() {
-        let mut c = Config::new();
-        c.set_url(String::from("http://foolio.com"));
-        assert_eq!(c.url(), "http://foolio.com");
-    }
-
-    #[test]
-    fn topology() {
-        let mut c = Config::new();
-        c.set_topology(Topology::Leader);
-        assert_eq!(c.topology(), Topology::Leader);
+impl fmt::Display for GossipListenAddr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> result::Result<(), fmt::Error> {
+        write!(f, "{}", self.0)
     }
 }

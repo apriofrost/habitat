@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {Component} from "@angular/core";
-import {RouterLink} from "@angular/router";
+import { Component, Input } from "@angular/core";
+import { RouterLink } from "@angular/router";
 import config from "../config";
-import {UserNavComponent} from "./user-nav/UserNavComponent";
 
 @Component({
-    directives: [RouterLink, UserNavComponent],
-    inputs: ["appName", "isUserNavOpen", "isSignedIn", "username", "avatarUrl",
-        "signOut", "toggleUserNavMenu"],
     selector: "hab-header",
     template: `
       <div class="main-nav--container clearfix">
@@ -41,12 +37,12 @@ import {UserNavComponent} from "./user-nav/UserNavComponent";
               </g>
             </svg>
           </div>
-          <user-nav [isOpen]="isUserNavOpen"
+          <hab-user-nav [isOpen]="isUserNavOpen"
                     [isSignedIn]="isSignedIn"
                     [username]="username"
                     [avatarUrl]="avatarUrl"
                     [signOut]="signOut"
-                    [toggleUserNavMenu]="toggleUserNavMenu"></user-nav>
+                    [toggleUserNavMenu]="toggleUserNavMenu"></hab-user-nav>
           <ul class="main-nav--links">
             <li class="main-nav--link"><a class="search-packages" [routerLink]="['/pkgs', 'core']">Search Packages</a></li>
             <li class="main-nav--link"><a class="docs" href="{{config['docs_url']}}">Docs</a></li>
@@ -58,5 +54,13 @@ import {UserNavComponent} from "./user-nav/UserNavComponent";
 })
 
 export class HeaderComponent {
+    @Input() appName;
+    @Input() isUserNavOpen;
+    @Input() isSignedIn;
+    @Input() username;
+    @Input() avatarUrl;
+    @Input() signOut;
+    @Input() toggleUserNavMenu;
+
     get config() { return config; }
 }

@@ -32,6 +32,25 @@ pub fn become_command(command: PathBuf, args: Vec<OsString>) -> Result<()> {
     become_child_command(command, args)
 }
 
+/// Get process identifier of calling process.
+pub fn current_pid() -> u32 {
+    unsafe { kernel32::GetCurrentProcessId() as u32 }
+}
+
+/// Determines if a process is running with the given process identifier.
+pub fn is_alive(pid: u32) -> bool {
+    match handle_from_pid(pid) {
+        Some(handle) => {
+            let exit_status = exit_status(handle).expect("Failed to get exit status");
+            unsafe {
+                let _ = kernel32::CloseHandle(handle);
+            }
+            exit_status == STILL_ACTIVE
+        }
+        None => false,
+    }
+}
+
 /// Executes a command as a child process and exits with the child's exit code.
 ///
 /// Note that if successful, this function will not return.
@@ -63,6 +82,20 @@ fn handle_from_pid(pid: u32) -> Option<winapi::HANDLE> {
             return Some(proc_handle);
         }
     }
+}
+
+fn exit_status(handle: winapi::HANDLE) -> Result<u32> {
+    let mut exit_status: u32 = 0;
+
+    unsafe {
+        let ret = kernel32::GetExitCodeProcess(handle, &mut exit_status as winapi::LPDWORD);
+        if ret == 0 {
+            return Err(Error::GetExitCodeProcessFailed(format!("Failed to retrieve Exit Code: {}",
+                                                               io::Error::last_os_error())));
+        }
+    }
+
+    Ok(exit_status)
 }
 
 pub struct Child {
@@ -98,10 +131,10 @@ impl Child {
         match status {
             Ok(status) => {
                 Ok(Child {
-                    handle: win_handle,
-                    last_status: status,
-                    pid: child.id(),
-                })
+                       handle: win_handle,
+                       last_status: status,
+                       pid: child.id(),
+                   })
             }
             Err(e) => Err(Error::GetHabChildFailed(e)),
         }
@@ -116,18 +149,7 @@ impl Child {
             return Ok(HabExitStatus { status: Some(self.last_status.unwrap()) });
         }
 
-        let mut exit_status: u32 = 0;
-
-        unsafe {
-            let ret = kernel32::GetExitCodeProcess(self.handle.unwrap(),
-                                                   &mut exit_status as winapi::LPDWORD);
-            if ret == 0 {
-                return Err(Error::GetExitCodeProcessFailed(format!("Failed to retrieve Exit \
-                                                                    Code for pid {}: {}",
-                                                                   self.pid,
-                                                                   io::Error::last_os_error())));
-            }
-        }
+        let exit_status = exit_status(self.handle.unwrap())?;
 
         if exit_status == STILL_ACTIVE {
             return Ok(HabExitStatus { status: None });
@@ -238,7 +260,9 @@ mod tests {
     fn running_process_returns_no_exit_status() {
         let mut cmd = Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.\
                                     exe");
-        cmd.arg("-noprofile").arg("-command").arg("while($true) { Start-Sleep 1 }");
+        cmd.arg("-noprofile")
+            .arg("-command")
+            .arg("while($true) { Start-Sleep 1 }");
         let mut child = cmd.spawn().unwrap();
 
         let mut hab_child = HabChild::from(&mut child).unwrap();
@@ -263,7 +287,9 @@ mod tests {
     fn terminated_process_returns_non_zero_exit() {
         let mut cmd = Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.\
                                     exe");
-        cmd.arg("-noprofile").arg("-command").arg("while($true) { Start-Sleep 1 }");
+        cmd.arg("-noprofile")
+            .arg("-command")
+            .arg("while($true) { Start-Sleep 1 }");
         let mut child = cmd.spawn().unwrap();
 
         let mut hab_child = HabChild::from(&mut child).unwrap();

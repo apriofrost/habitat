@@ -62,7 +62,7 @@ impl GitHubClient {
                                       self.client_id,
                                       self.client_secret,
                                       code))
-            .unwrap();
+                .unwrap();
         let mut rep = try!(http_post(url));
         if rep.status.is_success() {
             let mut encoded = String::new();
@@ -107,7 +107,14 @@ impl GitHubClient {
             let err: HashMap<String, String> = try!(serde_json::from_str(&body));
             return Err(Error::GitHubAPI(rep.status, err));
         }
-        let contents: Contents = serde_json::from_str(&body).unwrap();
+        let mut contents: Contents = serde_json::from_str(&body).unwrap();
+
+        // We need to strip line feeds as the Github API has started to return
+        // base64 content with line feeds.
+        if contents.encoding == "base64" {
+            contents.content = contents.content.replace("\n", "");
+        }
+
         Ok(contents)
     }
 
@@ -199,7 +206,7 @@ impl GitHubClient {
 }
 
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Contents {
     pub name: String,
     pub path: String,
@@ -398,7 +405,11 @@ impl AuthOk {
     pub fn missing_auth_scopes(&self) -> Vec<&'static str> {
         let mut scopes = vec![];
         for scope in AUTH_SCOPES.iter() {
-            if !self.scope.split(",").collect::<Vec<&str>>().iter().any(|p| p == scope) {
+            if !self.scope
+                    .split(",")
+                    .collect::<Vec<&str>>()
+                    .iter()
+                    .any(|p| p == scope) {
                 scopes.push(*scope);
             }
         }

@@ -16,7 +16,7 @@
 
 use db::pool::Pool;
 use db::migration::Migrator;
-use protocol::{vault, jobsrv};
+use protocol::{originsrv, jobsrv};
 use postgres;
 
 use config::Config;
@@ -38,7 +38,7 @@ impl DataStore {
                              config.pool_size,
                              config.datastore_connection_retry_ms,
                              config.datastore_connection_timeout,
-                             config.datastore_connection_test)?;
+                             config.shards.clone())?;
         Ok(DataStore { pool: pool })
     }
 
@@ -52,17 +52,24 @@ impl DataStore {
     /// This includes all the schema and data migrations, along with stored procedures for data
     /// access.
     pub fn setup(&self) -> Result<()> {
-        let migrator = Migrator::new(&self.pool);
+        let conn = self.pool.get_raw()?;
+        let xact = conn.transaction().map_err(Error::DbTransactionStart)?;
+        let mut migrator = Migrator::new(xact, self.pool.shards.clone());
+
         migrator.setup()?;
 
+        migrator
+            .migrate("jobsrv", r#"CREATE SEQUENCE IF NOT EXISTS job_id_seq;"#)?;
+
         // The core jobs table
-        migrator.migrate("jobsrv",
-                     1,
+        migrator
+            .migrate("jobsrv",
                      r#"CREATE TABLE jobs (
-                                    id bigint PRIMARY KEY,
+                                    id bigint PRIMARY KEY DEFAULT next_id_v1('job_id_seq'),
                                     owner_id bigint,
                                     job_state text,
-                                    project_id text,
+                                    project_id bigint,
+                                    project_name text,
                                     project_owner_id bigint,
                                     project_plan_path text,
                                     vcs text,
@@ -75,20 +82,20 @@ impl DataStore {
 
         // Insert a new job into the jobs table
         migrator.migrate("jobsrv",
-                             2,
                              r#"CREATE OR REPLACE FUNCTION insert_job_v1 (
-                                id bigint, 
                                 owner_id bigint,
-                                project_id text,
+                                project_id bigint,
+                                project_name text,
                                 project_owner_id bigint,
                                 project_plan_path text,
                                 vcs text,
                                 vcs_arguments text[]
-                                ) RETURNS void AS $$
+                                ) RETURNS SETOF jobs AS $$
                                     BEGIN
-                                        INSERT INTO jobs (id, owner_id, job_state, project_id, project_owner_id, project_plan_path, vcs, vcs_arguments)
-                                        VALUES
-                                            (id, owner_id, 'Pending', project_id, project_owner_id, project_plan_path, vcs, vcs_arguments);
+                                        RETURN QUERY INSERT INTO jobs (owner_id, job_state, project_id, project_name, project_owner_id, project_plan_path, vcs, vcs_arguments)
+                                            VALUES (owner_id, 'Pending', project_id, project_name, project_owner_id, project_plan_path, vcs, vcs_arguments)
+                                            RETURNING *;
+                                        RETURN;
                                     END
                                 $$ LANGUAGE plpgsql VOLATILE
                                 "#)?;
@@ -101,8 +108,8 @@ impl DataStore {
         // generate Job structs, and keeps things DRY.
         //
         // Just make sure you always address the columns by name, not by position.
-        migrator.migrate("jobsrv",
-                     3,
+        migrator
+            .migrate("jobsrv",
                      r#"CREATE OR REPLACE FUNCTION get_job_v1 (jid bigint) RETURNS SETOF jobs AS $$
                             BEGIN
                               RETURN QUERY SELECT * FROM jobs WHERE id = jid;
@@ -128,7 +135,6 @@ impl DataStore {
         // Note that the sort order ensures that jobs that fail to dispatch and are then returned
         // will be the first job selected, making FIFO a reality.
         migrator.migrate("jobsrv",
-                         4,
                          r#"CREATE OR REPLACE FUNCTION pending_jobs_v1 (integer) RETURNS SETOF jobs AS
                                 $$
                                 DECLARE
@@ -150,12 +156,16 @@ impl DataStore {
 
         // Update the state of a job. Takes a job id and a state, and updates that row.
         migrator.migrate("jobsrv",
-                         5,
                          r#"CREATE OR REPLACE FUNCTION set_job_state_v1 (jid bigint, jstate text) RETURNS void AS $$
                             BEGIN
                                 UPDATE jobs SET job_state=jstate, updated_at=now() WHERE id=jid;
                             END
                          $$ LANGUAGE plpgsql VOLATILE"#)?;
+        migrator.migrate("jobsrv",
+                         r#"CREATE INDEX pending_jobs_index_v1 on jobs(created_at) WHERE job_state = 'Pending'"#)?;
+
+        migrator.finish()?;
+
         Ok(())
     }
 
@@ -166,25 +176,26 @@ impl DataStore {
     /// * If the pool has no connections available
     /// * If the job cannot be created
     /// * If the job has an unknown VCS type
-    pub fn create_job(&self, job: &jobsrv::Job) -> Result<()> {
-        let project = job.get_project();
+    pub fn create_job(&self, job: &jobsrv::Job) -> Result<jobsrv::Job> {
+        let conn = self.pool.get_shard(0)?;
 
-        let conn = self.pool.get()?;
+        if job.get_project().get_vcs_type() == "git" {
+            let project = job.get_project();
 
-        if project.has_git() {
-            conn.execute("SELECT insert_job_v1($1, $2, $3, $4, $5, $6, $7)",
-                         &[&(job.get_id() as i64),
-                           &(job.get_owner_id() as i64),
-                           &project.get_id(),
-                           &(project.get_owner_id() as i64),
-                           &project.get_plan_path(),
-                           &"git",
-                           &vec![project.get_git().get_url()]])
+            let rows = conn.query("SELECT * FROM insert_job_v1($1, $2, $3, $4, $5, $6, $7)",
+                                  &[&(job.get_owner_id() as i64),
+                                    &(project.get_id() as i64),
+                                    &project.get_name(),
+                                    &(project.get_owner_id() as i64),
+                                    &project.get_plan_path(),
+                                    &project.get_vcs_type(),
+                                    &vec![project.get_vcs_data()]])
                 .map_err(Error::JobCreate)?;
+            let job = self.row_to_job(&rows.get(0))?;
+            return Ok(job);
         } else {
             return Err(Error::UnknownVCS);
         }
-        Ok(())
     }
 
     /// Translate a database `jobs` row to a `jobsrv::Job`.
@@ -211,8 +222,10 @@ impl DataStore {
         };
         job.set_state(job_state);
 
-        let mut project = vault::Project::new();
-        project.set_id(row.get("project_id"));
+        let mut project = originsrv::OriginProject::new();
+        let project_id: i64 = row.get("project_id");
+        project.set_id(project_id as u64);
+        project.set_name(row.get("project_name"));
         let project_owner_id: i64 = row.get("project_owner_id");
         project.set_owner_id(project_owner_id as u64);
         project.set_plan_path(row.get("project_plan_path"));
@@ -220,10 +233,9 @@ impl DataStore {
         let rvcs: String = row.get("vcs");
         match rvcs.as_ref() {
             "git" => {
-                let mut vcs = vault::VCSGit::new();
                 let mut vcsa: Vec<String> = row.get("vcs_arguments");
-                vcs.set_url(vcsa.remove(0));
-                project.set_git(vcs);
+                project.set_vcs_type(String::from("git"));
+                project.set_vcs_data(vcsa.remove(0));
             }
             e => {
                 error!("Unknown VCS, {}", e);
@@ -241,10 +253,11 @@ impl DataStore {
     ///
     /// * If a connection cannot be gotten from the pool
     /// * If the job cannot be selected from the database
-    pub fn get_job(&self, id: u64) -> Result<Option<jobsrv::Job>> {
-        let conn = self.pool.get()?;
-        let rows = &conn.query("SELECT * FROM get_job_v1($1)", &[&(id as i64)])
-            .map_err(Error::JobGet)?;
+    pub fn get_job(&self, get_job: &jobsrv::JobGet) -> Result<Option<jobsrv::Job>> {
+        let conn = self.pool.get_shard(0)?;
+        let rows = &conn.query("SELECT * FROM get_job_v1($1)",
+                               &[&(get_job.get_id() as i64)])
+                        .map_err(Error::JobGet)?;
         for row in rows {
             let job = self.row_to_job(&row)?;
             return Ok(Some(job));
@@ -261,9 +274,9 @@ impl DataStore {
     /// * If the row returned cannot be translated into a Job
     pub fn pending_jobs(&self, count: i32) -> Result<Vec<jobsrv::Job>> {
         let mut jobs = Vec::new();
-        let conn = self.pool.get()?;
+        let conn = self.pool.get_shard(0)?;
         let rows = &conn.query("SELECT * FROM pending_jobs_v1($1)", &[&count])
-            .map_err(Error::JobPending)?;
+                        .map_err(Error::JobPending)?;
         for row in rows {
             let job = self.row_to_job(&row)?;
             jobs.push(job);
@@ -278,7 +291,7 @@ impl DataStore {
     /// * If a connection cannot be gotten from the pool
     /// * If the jobs state cannot be updated in the database
     pub fn set_job_state(&self, job: &jobsrv::Job) -> Result<()> {
-        let conn = self.pool.get()?;
+        let conn = self.pool.get_shard(0)?;
         let job_id = job.get_id() as i64;
         let job_state = match job.get_state() {
             jobsrv::JobState::Dispatched => "Dispatched",

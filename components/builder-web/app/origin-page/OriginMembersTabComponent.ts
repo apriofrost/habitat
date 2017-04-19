@@ -15,13 +15,11 @@
 import {Component, Input, OnInit} from "@angular/core";
 import {FormControl, FormGroup, FormBuilder, Validators} from "@angular/forms";
 import {List} from "immutable";
-import {TabComponent} from "../TabComponent";
 
 @Component({
     selector: "hab-origin-members-tab",
-    directives: [TabComponent],
     template: `
-    <tab tabTitle="Members">
+    <hab-tab tabTitle="Members">
         <div class="page-body">
             <div class="hab-origin--left">
                 <div class="hab-origin-members-tab--section invite-members">
@@ -83,7 +81,7 @@ import {TabComponent} from "../TabComponent";
                 </p>
             </div>
         </div>
-    </tab>
+    </hab-tab>
     `,
 })
 
@@ -94,14 +92,14 @@ export class OriginMembersTabComponent implements OnInit {
     @Input() members: List<Object>;
     @Input() onSubmit: Function;
 
-    private form: FormGroup;
-    private control: FormControl;
+    form: FormGroup;
+    control: FormControl;
 
     constructor(formBuilder: FormBuilder) {
         this.form = formBuilder.group({});
     }
 
-    private submit(username: string) {
+    submit(username: string) {
         this.onSubmit(username);
     }
 

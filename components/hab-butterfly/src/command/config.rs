@@ -53,25 +53,14 @@ pub mod apply {
             }
         };
 
-        // We want to expire the borrow of body before we check to see if we need
-        // to encrypt the contents.
-        {
-            let toml_str = try!(str::from_utf8(&body)
-                .map_err(|e| Error::Utf8Error(format!("{}", e))));
-            let mut parser = toml::Parser::new(toml_str);
-            match parser.parse() {
-                Some(_) => try!(ui.status(Status::Verified, "this configuration is valid TOML")),
-                None => {
-                    for err in parser.errors.iter() {
-                        try!(ui.fatal("Invalid TOML"));
-                        try!(ui.br());
-                        try!(ui.para(&toml_str[0..err.lo]));
-                        try!(ui.warn(format!("^^^^ {} ^^^^", err)));
-                        try!(ui.br());
-                        try!(ui.para(&toml_str[err.lo..]));
-                        return Err(Error::TomlError);
-                    }
-                }
+        match toml::de::from_slice::<toml::value::Value>(&body) {
+            Ok(_) => try!(ui.status(Status::Verified, "this configuration is valid TOML")),
+            Err(err) => {
+                try!(ui.fatal("Invalid TOML"));
+                try!(ui.br());
+                try!(ui.warn(&err));
+                try!(ui.br());
+                return Err(Error::TomlDeserializeError(err));
             }
         }
 
@@ -89,8 +78,9 @@ pub mod apply {
             try!(ui.status(Status::Applying, format!("to peer {}", peer)));
             let mut client = try!(Client::new(peer, ring_key.map(|k| k.clone()))
                 .map_err(|e| Error::ButterflyError(format!("{}", e))));
-            try!(client.send_service_config(sg.clone(), number, body.clone(), encrypted)
-                .map_err(|e| Error::ButterflyError(format!("{}", e))));
+            try!(client
+                     .send_service_config(sg.clone(), number, body.clone(), encrypted)
+                     .map_err(|e| Error::ButterflyError(format!("{}", e))));
 
             // please take a moment to weep over the following line
             // of code. We must sleep to allow messages to be sent

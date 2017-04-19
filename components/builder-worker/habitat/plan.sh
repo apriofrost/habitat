@@ -16,10 +16,7 @@ pkg_svc_group="root"
 
 do_verify() {
   pushd $PLAN_CONTEXT/../../.. > /dev/null
-  pkg_version=`git rev-list master --count`
-  pkg_dirname="${pkg_name}-${pkg_version}"
-  pkg_prefix="$HAB_PKG_PATH/${pkg_origin}/${pkg_name}/${pkg_version}/${pkg_release}"
-  pkg_artifact="$HAB_CACHE_ARTIFACT_PATH/${pkg_origin}-${pkg_name}-${pkg_version}-${pkg_release}-${pkg_target}.${_artifact_ext}"
+  update_pkg_version
   popd > /dev/null
 }
 
@@ -35,8 +32,12 @@ do_prepare() {
   export PLAN_VERSION="${pkg_version}/${pkg_release}"
   build_line "Setting PLAN_VERSION=$PLAN_VERSION"
 
-  # Used by Cargo to use a pristine, isolated directory for all compilation
-  export CARGO_TARGET_DIR="$HAB_CACHE_SRC_PATH/$pkg_dirname"
+  if [ -z "$HAB_CARGO_TARGET_DIR" ]; then
+    # Used by Cargo to use a pristine, isolated directory for all compilation
+    export CARGO_TARGET_DIR="$HAB_CACHE_SRC_PATH/$pkg_dirname"
+  else
+    export CARGO_TARGET_DIR="$HAB_CARGO_TARGET_DIR"
+  fi
   build_line "Setting CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 
   export LIBARCHIVE_LIB_DIR="$(pkg_path_for libarchive)/lib"
@@ -69,6 +70,25 @@ do_install() {
 do_strip() {
   if [[ "$build_type" != "--debug" ]]; then
     do_default_strip
+  fi
+}
+
+update_pkg_version() {
+  # Update the `$pkg_version` using Git to determine the value
+  pkg_version="$(git rev-list master --count)"
+  build_line "Version updated to $pkg_version"
+
+  # Several metadata values get their defaults from the value of `$pkg_version`
+  # so we must update these as well
+  pkg_dirname=${pkg_name}-${pkg_version}
+  pkg_prefix=$HAB_PKG_PATH/${pkg_origin}/${pkg_name}/${pkg_version}/${pkg_release}
+  pkg_artifact="$HAB_CACHE_ARTIFACT_PATH/${pkg_origin}-${pkg_name}-${pkg_version}-${pkg_release}-${pkg_target}.${_artifact_ext}"
+  if [[ "$CACHE_PATH" == "$SRC_PATH" ]]; then
+    local update_src_path=true
+  fi
+  CACHE_PATH="$HAB_CACHE_SRC_PATH/$pkg_dirname"
+  if [[ "${update_src_path:-}" == true ]]; then
+    SRC_PATH="$CACHE_PATH"
   fi
 }
 

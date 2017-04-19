@@ -23,7 +23,7 @@ use std::str::{self, FromStr};
 
 use habitat_core::crypto::{BoxKeyPair, default_cache_key_path};
 use habitat_core::service::ServiceGroup;
-use protobuf::Message;
+use protobuf::{self, Message};
 use toml;
 
 use error::{Error, Result};
@@ -109,11 +109,13 @@ impl ServiceConfig {
     pub fn config(&self) -> Result<toml::Value> {
         let config = if self.get_encrypted() {
             let bytes = try!(BoxKeyPair::decrypt(self.get_config(), &default_cache_key_path(None)));
-            let encoded = try!(str::from_utf8(&bytes)
+            let encoded =
+                try!(str::from_utf8(&bytes)
                 .map_err(|e| Error::ServiceConfigNotUtf8(self.get_service_group().to_string(), e)));
             try!(self.parse_config(&encoded))
         } else {
-            let encoded = try!(str::from_utf8(self.get_config())
+            let encoded =
+                try!(str::from_utf8(self.get_config())
                 .map_err(|e| Error::ServiceConfigNotUtf8(self.get_service_group().to_string(), e)));
             try!(self.parse_config(&encoded))
         };
@@ -127,6 +129,11 @@ impl ServiceConfig {
 }
 
 impl Rumor for ServiceConfig {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let rumor = protobuf::parse_from_bytes::<ProtoRumor>(bytes)?;
+        Ok(ServiceConfig::from(rumor))
+    }
+
     /// Follows a simple pattern; if we have a newer incarnation than the one we already have, the
     /// new one wins. So far, these never change.
     fn merge(&mut self, mut other: ServiceConfig) -> bool {

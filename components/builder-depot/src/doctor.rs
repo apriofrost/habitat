@@ -16,15 +16,14 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use dbcache::BasicSet;
 use hab_core;
 use hab_core::package::{FromArchive, PackageArchive};
-use protocol::depotsrv;
+use hab_net::routing::Broker;
+use protocol::originsrv;
 use time;
 use walkdir::WalkDir;
 
-use super::Depot;
-use data_store::DataStore;
+use super::DepotUtil;
 use error::Result;
 
 #[derive(Debug)]
@@ -135,12 +134,12 @@ pub enum Operation {
 
 struct Doctor<'a> {
     report: ReportBuilder,
-    depot: &'a Depot,
+    depot: &'a DepotUtil,
     packages_path: PathBuf,
 }
 
 impl<'a> Doctor<'a> {
-    pub fn new(depot: &'a Depot) -> Self {
+    pub fn new(depot: &'a DepotUtil) -> Self {
         let report = ReportBuilder::new();
         let mut packages = depot.packages_path().clone();
         packages.pop();
@@ -154,7 +153,6 @@ impl<'a> Doctor<'a> {
 
     fn run(mut self) -> Result<Report> {
         try!(self.init_fs());
-        try!(self.truncate_datastore(&self.depot.datastore));
         try!(self.rebuild_metadata());
         Ok(self.report.generate())
     }
@@ -163,12 +161,14 @@ impl<'a> Doctor<'a> {
         match fs::metadata(&self.depot.config.path) {
             Ok(meta) => {
                 if meta.is_file() {
-                    self.report.failure(OperationType::InitDepotFs(self.depot.config.path.clone()),
-                                        Reason::FileExists);
+                    self.report
+                        .failure(OperationType::InitDepotFs(self.depot.config.path.clone()),
+                                 Reason::FileExists);
                 }
                 if meta.permissions().readonly() {
-                    self.report.failure(OperationType::InitDepotFs(self.depot.config.path.clone()),
-                                        Reason::BadPermissions);
+                    self.report
+                        .failure(OperationType::InitDepotFs(self.depot.config.path.clone()),
+                                 Reason::BadPermissions);
                 }
                 try!(fs::create_dir_all(&self.depot.packages_path()));
             }
@@ -190,10 +190,11 @@ impl<'a> Doctor<'a> {
             let mut archive = PackageArchive::new(PathBuf::from(entry.path()));
             match archive.ident() {
                 Ok(ident) => {
-                    match depotsrv::Package::from_archive(&mut archive) {
-                        Ok(object) => {
-                            try!(self.depot.datastore.packages.write(&object));
-                            let path = self.depot.archive_path(&ident);
+                    match originsrv::OriginPackageCreate::from_archive(&mut archive) {
+                        Ok(package) => {
+                            let mut conn = Broker::connect().unwrap();
+                            conn.route::<originsrv::OriginPackageCreate, originsrv::OriginPackage>(&package)?;
+                            let path = self.depot.archive_path(&ident, &try!(archive.target()));
                             if let Some(e) = fs::create_dir_all(path.parent().unwrap()).err() {
                                 self.report
                                     .failure(OperationType::ArchiveInsert(entry.path()
@@ -212,25 +213,28 @@ impl<'a> Doctor<'a> {
                             }
                             self.report
                                 .success(OperationType::ArchiveInsert(path.to_string_lossy()
-                                    .to_string()));
+                                                                          .to_string()));
                         }
                         Err(e) => {
                             // We should be moving this back to the garbage directory and recording
                             // the path of it there in this failure
                             self.report
-                                .failure(OperationType::ArchiveInsert(entry.path()
-                                             .to_string_lossy()
-                                             .to_string()),
+                                .failure(OperationType::ArchiveInsert(entry
+                                                                          .path()
+                                                                          .to_string_lossy()
+                                                                          .to_string()),
                                          Reason::BadMetadata(e));
                         }
                     }
                 }
                 Err(e) => {
                     debug!("Error reading, archive={:?} error={:?}", &archive, &e);
-                    self.report.failure(OperationType::ArchiveInsert(entry.path()
-                                            .to_string_lossy()
-                                            .to_string()),
-                                        Reason::BadArchive);
+                    self.report
+                        .failure(OperationType::ArchiveInsert(entry
+                                                                  .path()
+                                                                  .to_string_lossy()
+                                                                  .to_string()),
+                                 Reason::BadArchive);
                 }
             }
         }
@@ -238,19 +242,13 @@ impl<'a> Doctor<'a> {
         for dir in directories.iter() {
             if let Some(e) = fs::remove_dir(dir.path()).err() {
                 debug!("Error deleting: {:?}", &e);
-                self.report.failure(OperationType::CleanupTrash(self.packages_path
-                                        .to_string_lossy()
-                                        .to_string()),
-                                    Reason::NotEmpty);
+                self.report
+                    .failure(OperationType::CleanupTrash(self.packages_path
+                                                             .to_string_lossy()
+                                                             .to_string()),
+                             Reason::NotEmpty);
             }
         }
-        Ok(())
-    }
-
-    fn truncate_datastore(&mut self, datastore: &DataStore) -> Result<()> {
-        let count = try!(datastore.key_count());
-        try!(datastore.clear());
-        self.report.success(OperationType::TruncateDataStore(count));
         Ok(())
     }
 }
@@ -261,6 +259,6 @@ impl<'a> Doctor<'a> {
 ///
 /// Any files found within the metastore which are not valid or readable archives are moved into a
 /// garbage directory for the user to examine.
-pub fn repair(depot: &Depot) -> Result<Report> {
+pub fn repair(depot: &DepotUtil) -> Result<Report> {
     Doctor::new(depot).run()
 }

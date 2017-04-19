@@ -26,6 +26,7 @@ The commands and sub-commands for the Habitat CLI (`hab`) are listed below.
 - [hab pkg sign](#hab-pkg-sign)
 - [hab pkg upload](#hab-pkg-upload)
 - [hab pkg verify](#hab-pkg-verify)
+- [hab plan init](#hab-plan-init)
 - [hab ring key export](#hab-ring-key-export)
 - [hab ring key generate](#hab-ring-key-generate)
 - [hab ring key import](#hab-ring-key-import)
@@ -165,7 +166,7 @@ Outputs the latest origin key contents to stdout
 
 **OPTIONS**
 
-    -t, --type <PAIR_TYPE>    Export either the `public' or `secret' key
+    -t, --type <PAIR_TYPE>    Export either the `public' or `secret' key (default: public)
 
 **ARGS**
 
@@ -242,7 +243,7 @@ Creates a symlink for a package binary in a common 'PATH' location
 **ARGS**
 
     <PKG_IDENT>    A package identifier (ex: core/redis, core/busybox-static/1.42.2)
-    <BINARY>       The command to symlink (ex: bash)
+    <BINARY>       The command to symlink (ex: bash)  If no binary is specified, all binaries from the specified package will be symlinked.
 
 <h2 id="hab-pkg-build" class="anchor">hab pkg build</h2>
 Builds a Plan using a Studio
@@ -434,6 +435,32 @@ Verifies a Habitat Artifact with an origin key
 **ARGS**
 
     <SOURCE>    A path to a Habitat Artifact (ex: /home/acme-redis-3.0.7-21120102031201-x86_64-linux.hart)
+
+<h2 id="hab-plan-init" class="anchor">hab plan init</h2>
+Generates common package specific configuration files. Executing
+without argument will create a `habitat` directory in your current
+folder for the plan. If `PKG_NAME` is specified it will create a
+folder with that name. Environment variables (those starting with
+`'pkg_'`) that are set will be used in the generated plan
+
+**USAGE**
+
+    hab plan init [FLAGS] [OPTIONS] [PKG_NAME]
+
+**FLAGS**
+
+    -f, --nocallbacks    Do not include callback functions in
+                         template
+    -h, --help           Prints help information
+    -V, --version        Prints version information
+
+**OPTIONS**
+
+    -o, --origin <ORIGIN>    Origin for the new app
+
+**ARGS**
+
+    <PKG_NAME>    Name for the new app.
 
 <h2 id="hab-ring-key-export" class="anchor">hab ring key export</h2>
 Outputs the latest ring key contents to stdout

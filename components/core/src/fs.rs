@@ -17,10 +17,9 @@ use std::path::{Path, PathBuf};
 
 use users;
 
+use package::{Identifiable, PackageInstall, PackageIdent};
 use env as henv;
 use error::Result;
-use super::package::PackageInstall;
-
 
 /// The default root path of the Habitat filesystem
 pub const ROOT_PATH: &'static str = "hab";
@@ -41,16 +40,24 @@ pub const PKG_PATH: &'static str = "hab/pkgs";
 /// Using this variable could lead to broken supervisor services and it should
 /// be used with extreme caution.
 pub const FS_ROOT_ENVVAR: &'static str = "FS_ROOT";
-/// The root path containing all runtime service directories and files
-const SVC_PATH: &'static str = "hab/svc";
+pub const SYSTEMDRIVE_ENVVAR: &'static str = "SYSTEMDRIVE";
 
 lazy_static! {
-    /// The default filesystem root path
-    pub static ref FS_ROOT_PATH: String = {
-        if cfg!(target_os = "windows") && henv::var(FS_ROOT_ENVVAR).is_ok() {
-            henv::var(FS_ROOT_ENVVAR).unwrap()
+    /// The default filesystem root path.
+    ///
+    /// WARNING: On Windows this variable mutates on first call if an environment variable with
+    ///          the key of `FS_ROOT_ENVVAR` is set.
+    pub static ref FS_ROOT_PATH: PathBuf = {
+        // JW TODO: When Windows container studios are available the platform reflection should
+        // be removed.
+        if cfg!(target_os = "windows") {
+            match (henv::var(FS_ROOT_ENVVAR), henv::var(SYSTEMDRIVE_ENVVAR)) {
+                (Ok(path), _) =>  PathBuf::from(path),
+                (Err(_), Ok(system_drive)) => PathBuf::from(format!("{}{}", system_drive, "/")),
+                (Err(_), Err(_)) => unreachable!("Windows should always have a SYSTEMDRIVE environment variable.")
+            }
         } else {
-            "/".to_string()
+            PathBuf::from("/")
         }
     };
 
@@ -152,47 +159,21 @@ pub fn cache_ssl_path(fs_root_path: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Returns the root path containing all runtime service directories and files
-pub fn svc_root() -> PathBuf {
-    Path::new("/").join(SVC_PATH).to_path_buf()
+pub fn pkg_root_path(fs_root: Option<&Path>) -> PathBuf {
+    let mut buf = fs_root.map_or(PathBuf::from("/"), |p| p.into());
+    buf.push(PKG_PATH);
+    buf
 }
 
-/// Returns the root path for a given service's configuration, files, and data.
-pub fn svc_path(service_name: &str) -> PathBuf {
-    Path::new("/").join(SVC_PATH).join(service_name)
-}
-
-/// Returns the path to a given service's configuration.
-pub fn svc_config_path(service_name: &str) -> PathBuf {
-    svc_path(service_name).join("config")
-}
-
-/// Returns the path to a given service's data.
-pub fn svc_data_path(service_name: &str) -> PathBuf {
-    svc_path(service_name).join("data")
-}
-
-/// Returns the path to a given service's gossiped config files.
-pub fn svc_files_path(service_name: &str) -> PathBuf {
-    svc_path(service_name).join("files")
-}
-
-/// Returns the path to a given service's hooks.
-///
-/// Note that this path is internal to the Supervisor and should not be directly accessed under
-/// normal circumstances.
-pub fn svc_hooks_path(service_name: &str) -> PathBuf {
-    svc_path(service_name).join("hooks")
-}
-
-/// Returns the path to a given service's static content.
-pub fn svc_static_path(service_name: &str) -> PathBuf {
-    svc_path(service_name).join("static")
-}
-
-/// Returns the path to a given service's variable state.
-pub fn svc_var_path(service_name: &str) -> PathBuf {
-    svc_path(service_name).join("var")
+pub fn pkg_install_path(ident: &PackageIdent, fs_root: Option<&Path>) -> PathBuf {
+    assert!(ident.fully_qualified(),
+            "Cannot determine install path without fully qualified ident");
+    let mut pkg_path = pkg_root_path(fs_root);
+    pkg_path.push(&ident.origin);
+    pkg_path.push(&ident.name);
+    pkg_path.push(ident.version.as_ref().unwrap());
+    pkg_path.push(ident.release.as_ref().unwrap());
+    pkg_path
 }
 
 /// Returns the absolute path for a given command, if it exists, by searching the `PATH`
@@ -282,8 +263,9 @@ pub fn find_command_in_pkg(command: &str,
                            fs_root_path: &Path)
                            -> Result<Option<PathBuf>> {
     for path in try!(pkg_install.paths()) {
-        let stripped = path.strip_prefix("/")
-            .expect(&format!("Package path missing / prefix {}", path.to_string_lossy()));
+        let stripped =
+            path.strip_prefix("/")
+                .expect(&format!("Package path missing / prefix {}", path.to_string_lossy()));
         let candidate = fs_root_path.join(stripped).join(command);
         if candidate.is_file() {
             return Ok(Some(path.join(command)));

@@ -13,14 +13,12 @@
 // limitations under the License.
 
 import {Component, OnInit} from "@angular/core";
-import {RouterLink} from "@angular/router";
 import {AppStore} from "../AppStore";
 import {setGitHubAuthState, signOut} from "../actions/index";
 import config from "../config";
 import {createGitHubLoginUrl, icon} from "../util";
 
 @Component({
-    directives: [RouterLink],
     template: `
     <div class="hab-sign-in">
         <div class="page-title">
@@ -101,15 +99,17 @@ export class SignInPageComponent implements OnInit {
 
     get sourceCodeUrl() { return config["source_code_url"]; }
 
-    private icon(name) { return icon(name); }
-
-    private signOut() {
+    signOut() {
         this.store.dispatch(signOut());
     }
 
-    public ngOnInit() {
+    ngOnInit() {
         // Populate the GitHub authstate (used to get a token) in SessionStorage
         // either with what's there already, or with a new UUID.
         this.store.dispatch(setGitHubAuthState());
+    }
+
+    private icon(name) {
+        return icon(name);
     }
 }

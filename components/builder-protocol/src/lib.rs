@@ -20,7 +20,6 @@ extern crate serde;
 extern crate serde_derive;
 extern crate time;
 
-pub mod depotsrv;
 pub mod error;
 pub mod jobsrv;
 pub mod net;
@@ -28,9 +27,10 @@ pub mod routesrv;
 pub mod search;
 pub mod sessionsrv;
 pub mod sharding;
-pub mod vault;
+pub mod originsrv;
+pub mod scheduler;
 mod message;
 
 pub use self::error::{ProtocolError, ProtocolResult};
 pub use self::message::{Message, Persistable, Routable, RouteKey};
-pub use self::sharding::InstaId;
+pub use self::sharding::{ShardId, SHARD_COUNT, InstaId};

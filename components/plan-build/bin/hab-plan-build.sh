@@ -102,7 +102,8 @@
 # ```
 #
 # ### pkg_source
-# Where to download the source from. Any valid `wget` url will work.
+# Where to download an external source from. Any valid `wget` url will work. If
+# the source is local to the `plan.sh`, then omit this value.
 # ```
 # pkg_source=http://downloads.sourceforge.net/project/libpng/$pkg_name/${pkg_version}/${pkg_name}-${pkg_version}.tar.gz
 # ```
@@ -114,8 +115,9 @@
 # ```
 #
 # ### pkg_shasum
-# The sha256 sum of the downloaded `$pkg_source`. You can easily generate by
-# downloading the source and using `sha256sum` or `gsha256sum`.
+# The sha256 sum of for the externally downloaded `$pkg_source`, if used. You
+# can easily generate by downloading the source and using `sha256sum` or
+# `gsha256sum`.
 # ```
 # pkg_shasum=36658cb768a54c1d4dec43c3116c27ed893e88b02ecfcb44f2166f9c0b7f2a0d
 # ```
@@ -191,6 +193,24 @@
 # pkg_exposes=(port)
 # ```
 #
+# ### pkg_binds
+# An associative array representing services which you depend on and the configuration keys that
+# you expect the service to export (by their `pkg_exports`). These binds *must* be set for the
+# supervisor to load the service. The loaded service will wait to run until it's bind becomes
+# available. If the bind does not contain the expected keys, the service will not start
+# successfully.
+# ```
+# pkg_binds=(
+#   [database]="port host"
+# )
+#
+# ### pkg_binds_optional
+# Same as `pkg_binds` but these represent optional services to connect to.
+# ```
+# pkg_binds_optional=(
+#   [storage]="port host"
+# )
+#
 # ### pkg_origin
 # A string to use for the origin. The origin is used to denote a particular upstream of a
 # package; when we resolve dependencies, we consider a version of a package to be equal
@@ -223,7 +243,8 @@
 # * `$pkg_svc_var_path`: Variable state; `$pkg_svc_path/var`
 # * `$pkg_svc_config_path`: Configuration; `$pkg_svc_path/config`
 # * `$pkg_svc_static_path`: Static content; `$pkg_svc_path/static`
-# * `$HAB_CACHE_SRC_PATH`: The path to all the package sources
+# * `$HAB_CACHE_SRC_PATH`: The path to all the externally downloaded package
+#      sources
 # * `$HAB_CACHE_ARTIFACT_PATH`: The default download root path for package
 #      artifacts, used on package installation
 # * `$HAB_CACHE_KEY_PATH`: The path where cryptographic keys are stored
@@ -376,10 +397,28 @@ pkg_pconfig_dirs=()
 pkg_svc_run=''
 pkg_exposes=()
 declare -A pkg_exports
+declare -A pkg_binds
+declare -A pkg_binds_optional
 # The user to run the service as
 pkg_svc_user=hab
 # The group to run the service as
 pkg_svc_group=$pkg_svc_user
+
+# The environment variables inside a package
+declare -A pkg_env
+# The build environment variables inside a package
+declare -A pkg_build_env
+# The internal field separator used to join `env` variables for cascading
+declare -A _env_default_sep=(
+  ['CFLAGS']=' '
+  ['CPPFLAGS']=' '
+  ['CXXFLAGS']=' '
+  ['LDFLAGS']=' '
+  ['LD_RUN_PATH']=':'
+  ['PATH']=':'
+  ['PKG_CONFIG_PATH']=':'
+)
+declare -A pkg_env_sep
 
 # Initially set $pkg_svc_* variables. This happens before the Plan is sourced,
 # meaning that `$pkg_name` is not yet set. However, `$pkg_svc_run` wants
@@ -697,6 +736,33 @@ _get_tdeps_for() {
   return 0
 }
 
+# **Internal** Returns (on stdout) the `DEPS` file contents of another locally
+# installed package which contain the set of all direct run dependencies. An
+# empty set could be returned as whitespace and/or newlines.  The lack of a
+# `DEPS` file in the desired package will be considered an unset, or empty set.
+#
+# ```
+# _get_deps_for /hab/pkgs/acme/a/4.2.2/20160113044458
+# # /hab/pkgs/acme/dep-b/1.2.3/20160113033619
+# # /hab/pkgs/acme/dep-c/5.0.1/20160113033507
+# # /hab/pkgs/acme/dep-d/2.0.0/20160113033539
+# # /hab/pkgs/acme/dep-e/10.0.1/20160113033453
+# # /hab/pkgs/acme/dep-f/4.2.2/20160113033338
+# # /hab/pkgs/acme/dep-g/4.2.2/20160113033319
+# ```
+#
+# Will return 0 in any case and the contents of `DEPS` if the file exists.
+_get_deps_for() {
+  local pkg_path="$1"
+  if [[ -f "$pkg_path/DEPS" ]]; then
+    cat $pkg_path/DEPS
+  else
+    # No file, meaning an empty set
+    echo
+  fi
+  return 0
+}
+
 # **Internal** Appends an entry to the given array only if the entry is not
 # already present and returns the resulting array back on stdout. In so doing,
 # this function mimics a set when adding new entries. Note that any array can
@@ -773,6 +839,210 @@ _determine_hab_bin() {
     HAB_BIN="$_hab_cmd"
   fi
   build_line "Using HAB_BIN=$HAB_BIN for installs, signing, and hashing"
+}
+
+# **Internal** Create initial pacakge-related arrays.
+_init_dependencies() {
+  # Create `${pkg_build_deps_resolved[@]}` containing all resolved direct build
+  # dependencies.
+  pkg_build_deps_resolved=()
+
+  # Create `${pkg_build_tdeps_resolved[@]}` containing all the direct build
+  # dependencies, and the run dependencies for each direct build dependency.
+  pkg_build_tdeps_resolved=()
+
+  # Create `${pkg_deps_resolved[@]}` containing all resolved direct run
+  # dependencies.
+  pkg_deps_resolved=()
+
+  # Create `${pkg_tdeps_resolved[@]}` containing all the direct run
+  # dependencies, and the run dependencies for each direct run dependency.
+  pkg_tdeps_resolved=()
+}
+
+# **Internal** Installs the scaffolding dependencies and for each scaffolding
+# package, add itself and each direct run dependency to the start of
+# `${pkg_build_deps[@]}`. In this way, it would be as if the Plan author had
+# added each of these dependencies directly into their `${pkg_build_deps[@]}`.
+# Each of these direct run dependencies are fully qualified so that when
+# resolving all build dependencies, only each specific package is locked down.
+_resolve_scaffolding_dependencies() {
+  if [[ -z "${pkg_scaffolding:-}" ]]; then
+    return 0
+  fi
+
+  build_line "Resolving scaffolding dependencies"
+  local resolved
+  local dep
+  local tdep
+  local tdeps
+  local sdep
+  local sdeps
+  local scaff_build_deps
+
+  scaff_build_deps=()
+
+  for dep in "${pkg_scaffolding}"; do
+    _install_dependency $dep
+    # Add scaffolding pacakge to the list of scaffolding build deps
+    scaff_build_deps+=($dep)
+    if resolved="$(_resolve_dependency $dep)"; then
+      build_line "Resolved scaffolding dependency '$dep' to $resolved"
+      # Add each (fully qualified) direct run dependency of the scaffolding
+      # package.
+      sdeps=($(_get_deps_for "$resolved"))
+      for sdep in "${sdeps[@]}"; do
+        scaff_build_deps+=($sdep)
+      done
+    else
+      exit_with "Resolving '$dep' failed, should this be built first?" 1
+    fi
+  done
+
+  # Add all of the ordered scaffolding dependencies to the start of
+  # `${pkg_build_deps[@]}` to make sure they could be ovveridden by a Plan
+  # author if required.
+  pkg_build_deps=(${scaff_build_deps[@]} ${pkg_build_deps[@]})
+  debug "Updating pkg_build_deps=(${pkg_build_deps[*]}) from Scaffolding deps"
+}
+
+# **Internal** Determines suitable package identifiers for each build
+# dependency and populates several package-related arrays for use throughout
+# this program.
+#
+# Walk each item in `$pkg_build_deps`, and for each item determine the absolute
+# path to a suitable package release (which will be on disk).
+_resolve_build_dependencies() {
+  build_line "Resolving build dependencies"
+  local resolved
+  local dep
+  local tdep
+  local tdeps
+
+  # Append to `${pkg_build_deps_resolved[@]}` all resolved direct build
+  # dependencies.
+  for dep in "${pkg_build_deps[@]}"; do
+    _install_dependency $dep
+    if resolved="$(_resolve_dependency $dep)"; then
+      build_line "Resolved build dependency '$dep' to $resolved"
+      pkg_build_deps_resolved+=($resolved)
+    else
+      exit_with "Resolving '$dep' failed, should this be built first?" 1
+    fi
+  done
+
+  # Append to `${pkg_build_tdeps_resolved[@]}` all the direct build
+  # dependencies, and the run dependencies for each direct build dependency.
+
+  # Copy all direct build dependencies into a new array
+  pkg_build_tdeps_resolved=("${pkg_build_deps_resolved[@]}")
+  # Append all non-direct (transitive) run dependencies for each direct build
+  # dependency. That's right, not a typo ;) This is how a `acme/gcc` build
+  # dependency could pull in `acme/binutils` for us, as an example. Any
+  # duplicate entries are dropped to produce a proper set.
+  for dep in "${pkg_build_deps_resolved[@]}"; do
+    tdeps=($(_get_tdeps_for $dep))
+    for tdep in "${tdeps[@]}"; do
+      tdep="$HAB_PKG_PATH/$tdep"
+      pkg_build_tdeps_resolved=(
+        $(_return_or_append_to_set "$tdep" "${pkg_build_tdeps_resolved[@]}")
+      )
+    done
+  done
+}
+
+# **Internal** Loads specified scaffolding to extend plan DSL. This assumes
+# the scaffolding lives within `lib` and is named `scaffolding.sh` for each
+# application/project type.
+_load_scaffolding() {
+  local lib
+  if [[ -z "${pkg_scaffolding:-}" ]]; then
+    return 0
+  fi
+
+  lib="$(_pkg_path_for_build_deps $pkg_scaffolding)/lib/scaffolding.sh"
+  build_line "Loading Scaffolding $lib"
+  if ! source "$lib"; then
+    exit_with "Failed to load Scaffolding from $lib" 17
+  fi
+
+  if [[ "$(type -t _scaffolding_begin)" == "function" ]]; then
+    _scaffolding_begin
+  fi
+}
+
+# **Internal** Determines suitable package identifiers for each run
+# dependency and populates several package-related arrays for use throughout
+# this program.
+#
+# Walk each item in $pkg_deps`, and for each item determine the absolute path
+# to a suitable package release (which will be on disk).
+_resolve_run_dependencies() {
+  build_line "Resolving run dependencies"
+  local resolved
+  local dep
+  local tdep
+  local tdeps
+
+  # Append to `${pkg_deps_resolved[@]}` all resolved direct run dependencies.
+  for dep in "${pkg_deps[@]}"; do
+    _install_dependency $dep
+    if resolved="$(_resolve_dependency $dep)"; then
+      build_line "Resolved dependency '$dep' to $resolved"
+      pkg_deps_resolved+=($resolved)
+    else
+      exit_with "Resolving '$dep' failed, should this be built first?" 1
+    fi
+  done
+
+  # Append to `${pkg_tdeps_resolved[@]}` all the direct run dependencies, and
+  # the run dependencies for each direct run dependency.
+
+  # Copy all direct dependencies into a new array
+  pkg_tdeps_resolved=("${pkg_deps_resolved[@]}")
+  # Append all non-direct (transitive) run dependencies for each direct run
+  # dependency. Any duplicate entries are dropped to produce a proper set.
+  for dep in "${pkg_deps_resolved[@]}"; do
+    tdeps=($(_get_tdeps_for $dep))
+    for tdep in "${tdeps[@]}"; do
+      tdep="$HAB_PKG_PATH/$tdep"
+      pkg_tdeps_resolved=(
+        $(_return_or_append_to_set "$tdep" "${pkg_tdeps_resolved[@]}")
+      )
+    done
+  done
+}
+
+# **Internal** Populates the remaining package-related arrays used throughout
+# this program.
+_populate_dependency_arrays() {
+  local dep
+
+  # Build `${pkg_all_deps_resolved[@]}` containing all direct build and run
+  # dependencies. The build dependencies appear before the run dependencies.
+  pkg_all_deps_resolved=(
+    "${pkg_deps_resolved[@]}"
+    "${pkg_build_deps_resolved[@]}"
+  )
+
+  # Build an ordered set of all build and run dependencies (direct and
+  # transitive). The order is important as this gets used when setting the
+  # `$PATH` ordering in the build environment. To give priority to direct
+  # dependencies over transitive ones the order of packages is the following:
+  #
+  # 1. All direct run dependencies
+  # 2. All direct build dependencies
+  # 3. All unique transitive run dependencies that aren't already added
+  # 4. All unique transitive build dependencies that aren't already added
+  pkg_all_tdeps_resolved=(
+    "${pkg_deps_resolved[@]}"
+    "${pkg_build_deps_resolved[@]}"
+  )
+  for dep in "${pkg_tdeps_resolved[@]}" "${pkg_build_tdeps_resolved[@]}"; do
+    pkg_all_tdeps_resolved=(
+      $(_return_or_append_to_set "$dep" "${pkg_all_tdeps_resolved[@]}")
+    )
+  done
 }
 
 # **Internal** Validates that the computed dependencies are reasonable and that
@@ -910,6 +1180,41 @@ _print_recursive_deps() {
   done
 }
 
+# **Internal** Returns the path for the desired build package dependency
+# on stdout from the resolved dependency set. Note that this function will
+# only look for resolved build dependencies--runtime dependencies are not
+# included in search.
+#
+# ```
+# pkg_build_deps_resolved=(
+#   /hab/pkgs/acme/zlib/1.2.8/20151216221001
+#   /hab/pkgs/acme/nginx/1.8.0/20150911120000
+#   /hab/pkgs/acme/glibc/2.22/20151216221001
+# )
+#
+# _pkg_path_for_build_deps acme/nginx
+# # /hab/pkgs/acme/nginx/1.8.0/20150911120000
+# _pkg_path_for_build_deps zlib
+# # /hab/pkgs/acme/zlib/1.2.8/20151216221001
+# _pkg_path_for_build_deps glibc/2.22
+# # /hab/pkgs/acme/glibc/2.22/20151216221001
+# ```
+#
+# Will return 0 if a package is found locally on disk, and 1 if a package
+# cannot be found. A message will be printed to stderr to provide context.
+_pkg_path_for_build_deps() {
+  local dep="$1"
+  local e
+  local cutn="$(($(echo $HAB_PKG_PATH | grep -o '/' | wc -l)+2))"
+  for e in "${pkg_build_deps_resolved[@]}"; do
+    if echo $e | cut -d "/" -f ${cutn}- | egrep -q "(^|/)${dep}(/|$)"; then
+      echo "$e"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # **Internal** Returns the path for the desired runtime package dependency
 # on stdout from the resolved dependency set. Note that this function will
 # only look for resolved runtime dependencies--build dependencies are not
@@ -922,17 +1227,17 @@ _print_recursive_deps() {
 #   /hab/pkgs/acme/glibc/2.22/20151216221001
 # )
 #
-# _pkg_path_for_deps_resolved acme/nginx
+# _pkg_path_for_deps acme/nginx
 # # /hab/pkgs/acme/nginx/1.8.0/20150911120000
-# _pkg_path_for_deps_resolved zlib
+# _pkg_path_for_deps zlib
 # # /hab/pkgs/acme/zlib/1.2.8/20151216221001
-# _pkg_path_for_deps_resolved glibc/2.22
+# _pkg_path_for_deps glibc/2.22
 # # /hab/pkgs/acme/glibc/2.22/20151216221001
 # ```
 #
 # Will return 0 if a package is found locally on disk, and 1 if a package
 # cannot be found. A message will be printed to stderr to provide context.
-_pkg_path_for_deps_resolved() {
+_pkg_path_for_deps() {
   local dep="$1"
   local e
   local cutn="$(($(echo $HAB_PKG_PATH | grep -o '/' | wc -l)+2))"
@@ -1100,7 +1405,7 @@ pkg_path_for() {
     fi
   done
   warn "pkg_path_for() '$dep' did not find a suitable installed package"
-  warn "Resolved package set: ${pkg_all_deps_resolved}"
+  warn "Resolved package set: (${pkg_all_deps_resolved[*]})"
   return 1
 }
 
@@ -1153,7 +1458,8 @@ attach() {
   set +e
   # Loop through input, REPL-style until either `"exit"` or `"quit"` is found
   while [[ "$cmd" != "exit" && "$cmd" != "quit" ]]; do
-    read -p "[$replno] ${pkg_name}($fname)> " cmd
+    read -e -r -p "[$replno] ${pkg_name}($fname)> " cmd
+    history -s $cmd
     case "$cmd" in
       vars) (set -o posix; set);;
       whereami*|\@*)
@@ -1223,8 +1529,123 @@ abspath() {
   fi
 }
 
+# Returns all items joined by defined IFS
+#
+# ```sh
+# join_by , a "b c" d
+# # a,b c,d
+# join_by / var local tmp
+# # var/local/tmp
+# join_by , "${FOO[@]}"
+# # a,b,c
+# ```
+#
+# Thanks to [Stack Overflow](http://stackoverflow.com/a/17841619/515789)
+join_by() {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+# Sets environment variable for package
+#
+# ```sh
+# add_env PATH 'bin' 'sbin'
+# add_env SETTINGS_MODULE 'app.settings'
+# ```
+add_env() {
+  local -u key=$1
+  shift
+  local values=($*)
+
+  if [ ${pkg_env[$key]+abc} ]; then
+    exit_with "Cannot add $key to pkg_env once the value is already set"
+  fi
+
+  if [ -n ${values} ]; then
+    # Set a default separator if none is defined
+    if [ ! ${pkg_env_sep[$key]+abc} ] && [ ${_env_default_sep[$key]+abc} ]; then
+      pkg_env_sep[$key]=${_env_default_sep[$key]}
+    fi
+
+    if [ ${#values[@]} -gt 1 ]; then
+      if [ ${pkg_env_sep[$key]+abc} ]; then
+        pkg_env[$key]=$(join_by ${pkg_env_sep[$key]} ${values[@]})
+      else
+        exit_with "Cannot add multiple values without setting a separator for $key"
+      fi
+    else
+      pkg_env[$key]=${values[0]}
+    fi
+  fi
+}
+
+# Adds `$pkg_prefix` to supplied paths
+#
+# ```sh
+# add_path_env PATH 'bin' 'sbin'
+# ```
+add_path_env() {
+  local key=$1
+  shift
+  local paths=()
+  for path in $*; do
+    paths+=("${pkg_prefix}/${path}")
+  done
+  add_env ${key} ${paths[@]}
+}
+
+# TODO: Make `add_build_env` and `add_build_path_env` more generic
+# Sets build environment variable for package
+#
+# ```sh
+# add_build_env PATH 'bin' 'sbin'
+# add_build_env SETTINGS_MODULE 'app.settings'
+# ```
+add_build_env() {
+  local -u key=$1
+  shift
+  local values=($*)
+
+  if [ ${pkg_build_env[$key]+abc} ]; then
+    exit_with "Cannot add $key to pkg_build_env once the value is already set"
+  fi
+
+  if [ -n ${values} ]; then
+    # Set a default separator if none is defined
+    if [ ! ${pkg_env_sep[$key]+abc} ] && [ ${_env_default_sep[$key]+abc} ]; then
+      pkg_env_sep[$key]=${_env_default_sep[$key]}
+    fi
+
+    if [ ${#values[@]} -gt 1 ]; then
+      if [ ${pkg_env_sep[$key]+abc} ]; then
+        pkg_build_env[$key]=$(join_by ${pkg_env_sep[$key]} ${values[@]})
+      else
+        exit_with "Cannot add multiple values without setting a separator for $key"
+      fi
+    else
+      pkg_build_env[$key]=${values[0]}
+    fi
+  fi
+}
+
+# Adds `$pkg_prefix` to supplied paths
+#
+# ```sh
+# add_build_path_env PATH 'bin' 'sbin'
+# ```
+add_build_path_env() {
+  local key=$1
+  shift
+  local paths=()
+  for path in $*; do
+    paths+=("${pkg_prefix}/${path}")
+  done
+  add_build_env ${key} ${paths[@]}
+}
+
 # **Internal** Convert a string into a numerical value.
-function _to_int() {
+_to_int() {
     local -i num="10#${1}"
     echo "${num}"
 }
@@ -1239,7 +1660,7 @@ function _to_int() {
 # _port_is_valid "hello"
 # # 1
 # ```
-function _port_is_valid() {
+_port_is_valid() {
     local port="$1"
     local -i port_num=$(_to_int $port 2>/dev/null)
     if (( $port_num < 1 || $port_num > 65535 )) ; then
@@ -1431,7 +1852,7 @@ fix_interpreter() {
 pkg_interpreter_for() {
     local pkg=$1
     local int=$2
-    local path=$(_pkg_path_for_deps_resolved $pkg)
+    local path=$(_pkg_path_for_deps $pkg)
     if [[ -z $path || $? -ne 0 ]]; then
       warn "Could not resolve the path for ${pkg}, is it specified in 'pkg_deps'?"
       return 1
@@ -1464,13 +1885,12 @@ do_default_begin() {
   return 0
 }
 
-# **Internal** Determines suitable package identifiers for each build and
-# run dependency and populates several package-related arrays for use
-# throughout this program.
+# **Internal** Downloads, resolves, and normalizes all build and run
+# dependencies. If Scaffolding is being used, this function also injects the
+# relevant packages into the build dependencies and allows Scaffolding packages
+# to further mutate the run dependencies for the Plan.
 #
-# Walk each item in `$pkg_build_deps` and $pkg_deps`, and for each
-# item determine the absolute path to a suitable package release (which will be
-# on disk). Then, several package-related arrays are created:
+# Several package-related arrays are created as a result:
 #
 # * `$pkg_build_deps_resolved`: A package-path array of all direct build
 #    dependencies, declared in `$pkg_build_deps`.
@@ -1484,102 +1904,33 @@ do_default_begin() {
 #    run dependencies, declared in `$pkg_build_deps` and `$pkg_deps`.
 # * `$pkg_all_tdeps_resolved`: An ordered package-path array of all direct
 #    build and run dependencies, and the run dependencies for each direct
-#    dependency. Further details below in the function.
+#    dependency. Further details for this array is described in the
+#    `_populate_dependency_arrays()` function.
 _resolve_dependencies() {
-  build_line "Resolving dependencies"
-  local resolved
-  local dep
-  local tdep
-  local tdeps
+  # Create initial package arrays
+  _init_dependencies
 
-  # Build `${pkg_build_deps_resolved[@]}` containing all resolved direct build
-  # dependencies.
-  pkg_build_deps_resolved=()
-  for dep in "${pkg_build_deps[@]}"; do
-    _install_dependency $dep
-    if resolved="$(_resolve_dependency $dep)"; then
-      build_line "Resolved build dependency '$dep' to $resolved"
-      pkg_build_deps_resolved+=($resolved)
-    else
-      exit_with "Resolving '$dep' failed, should this be built first?" 1
-    fi
-  done
+  # Inject, download, and resolve the scaffolding dependencies
+  _resolve_scaffolding_dependencies
 
-  # Build `${pkg_deps_resolved[@]}` containing all resolved direct run
-  # dependencies.
-  pkg_deps_resolved=()
-  for dep in "${pkg_deps[@]}"; do
-    _install_dependency $dep
-    if resolved="$(_resolve_dependency $dep)"; then
-      build_line "Resolved dependency '$dep' to $resolved"
-      pkg_deps_resolved+=($resolved)
-    else
-      exit_with "Resolving '$dep' failed, should this be built first?" 1
-    fi
-  done
+  # Download and resolve the build dependencies
+  _resolve_build_dependencies
 
-  # Build `${pkg_build_tdeps_resolved[@]}` containing all the direct build
-  # dependencies, and the run dependencies for each direct build dependency.
+  # Populate package arrays to enable helper functions for early scaffolding
+  # load hooks
+  _populate_dependency_arrays
 
-  # Copy all direct build dependencies into a new array
-  pkg_build_tdeps_resolved=("${pkg_build_deps_resolved[@]}")
-  # Append all non-direct (transitive) run dependencies for each direct build
-  # dependency. That's right, not a typo ;) This is how a `acme/gcc` build
-  # dependency could pull in `acme/binutils` for us, as an example. Any
-  # duplicate entries are dropped to produce a proper set.
-  for dep in "${pkg_build_deps_resolved[@]}"; do
-    tdeps=($(_get_tdeps_for $dep))
-    for tdep in "${tdeps[@]}"; do
-      tdep="$HAB_PKG_PATH/$tdep"
-      pkg_build_tdeps_resolved=(
-        $(_return_or_append_to_set "$tdep" "${pkg_build_tdeps_resolved[@]}")
-      )
-    done
-  done
+  # Load scaffolding packages if they are being used.
+  _load_scaffolding
 
-  # Build `${pkg_tdeps_resolved[@]}` containing all the direct run
-  # dependencies, and the run dependencies for each direct run dependency.
+  # Download and resolve the run dependencies
+  _resolve_run_dependencies
 
-  # Copy all direct dependencies into a new array
-  pkg_tdeps_resolved=("${pkg_deps_resolved[@]}")
-  # Append all non-direct (transitive) run dependencies for each direct run
-  # dependency. Any duplicate entries are dropped to produce a proper set.
-  for dep in "${pkg_deps_resolved[@]}"; do
-    tdeps=($(_get_tdeps_for $dep))
-    for tdep in "${tdeps[@]}"; do
-      tdep="$HAB_PKG_PATH/$tdep"
-      pkg_tdeps_resolved=(
-        $(_return_or_append_to_set "$tdep" "${pkg_tdeps_resolved[@]}")
-      )
-    done
-  done
+  # Finalize and normalize all resolved dependencies with all build and run
+  # dependencies
+  _populate_dependency_arrays
 
-  # Build `${pkg_all_deps_resolved[@]}` containing all direct build and run
-  # dependencies. The build dependencies appear before the run dependencies.
-  pkg_all_deps_resolved=(
-    "${pkg_deps_resolved[@]}"
-    "${pkg_build_deps_resolved[@]}"
-  )
-
-  # Build an ordered set of all build and run dependencies (direct and
-  # transitive). The order is important as this gets used when setting the
-  # `$PATH` ordering in the build environment. To give priority to direct
-  # dependencies over transitive ones the order of packages is the following:
-  #
-  # 1. All direct build dependencies
-  # 1. All direct run dependencies
-  # 1. All unique transitive build dependencies that aren't already added
-  # 1. All unique transitive run dependencies that aren't already added
-  pkg_all_tdeps_resolved=(
-    "${pkg_deps_resolved[@]}"
-    "${pkg_build_deps_resolved[@]}"
-  )
-  for dep in "${pkg_tdeps_resolved[@]}" "${pkg_build_tdeps_resolved[@]}"; do
-    pkg_all_tdeps_resolved=(
-      $(_return_or_append_to_set "$tdep" "${pkg_all_tdeps_resolved[@]}")
-    )
-  done
-
+  # Validate the dependency arrays
   _validate_deps
 }
 
@@ -1588,37 +1939,103 @@ _resolve_dependencies() {
 # or transitive) if one exists. The ordering of the path is specific to
 # `${pkg_all_tdeps_resolved[@]}` which is further explained in the
 # `_resolve_dependencies()` function.
-_set_path() {
-  local path_part=""
-  for path in "${pkg_bin_dirs[@]}"; do
-    if [[ -z $path_part ]]; then
-      path_part="$pkg_prefix/$path"
+_set_environment() {
+  local -A _environment
+
+  # Set any package pre-build environment variables
+  if [ -n ${pkg_bin_dirs} ]; then
+    add_path_env 'PATH' ${pkg_bin_dirs[@]}
+  fi
+
+  # Copy `$pkg_env` to `$_environment`
+  for env in "${!pkg_env[@]}"; do
+    _environment[$env]=${pkg_env[$env]}
+  done
+
+  # Copy `$pkg_build_env` to `$_environment`
+  for env in "${!pkg_build_env[@]}"; do
+    if [[ ${_environment[$env]+abc} && ${pkg_env_sep[$env]+abc} ]]; then
+      _environment[$env]=$(join_by ${pkg_env_sep[$env]} ${_environment[$env]} ${pkg_build_env[$env]})
+    elif [[ ! ${_environment[$env]+abc} ]]; then
+      _environment[$env]=${pkg_build_env[$env]}
     else
-      path_part="$path_part:$pkg_prefix/$path"
+      exit_with "Cannot add $$pkg_build_env without setting a separator for $env"
     fi
   done
+
   for dep_path in "${pkg_all_tdeps_resolved[@]}"; do
-    if [[ -f "$dep_path/PATH" ]]; then
-      local data=$(cat $dep_path/PATH)
-      local trimmed=$(trim $data)
-      if [[ -z $path_part ]]; then
-        path_part="$trimmed"
-      else
-        path_part="$path_part:$trimmed"
+    # If we have a ENVIRONMENT or BUILD_ENVIRONMENT skip looking for legacy files
+    if [[ -f "$dep_path/ENVIRONMENT" || -f "$dep_path/BUILD_ENVIRONMENT" ]]; then
+      local -A env_sep
+
+      if [[ -f "$dep_path/ENVIRONMENT_SEP" ]]; then
+        while read -r line; do
+          local -u env=${line%%=*}
+          local value=${line#*=}
+          if [[ -n "$env" && -n "$value" ]]; then
+            env_sep[$env]=${value}
+          fi
+        done < "$dep_path/ENVIRONMENT_SEP"
+      fi
+
+      if [[ -f "$dep_path/ENVIRONMENT" ]]; then
+        while read -r line; do
+          local -u env=${line%%=*}
+          local value=${line#*=}
+          if [[ -n "$env" && -n "$value" ]]; then
+            if [[ ${_environment[$env]+abc} && ${env_sep[$env]+abc} ]]; then
+              _environment[$env]=$(join_by ${env_sep[$env]} ${_environment[$env]} ${value})
+            elif [[ ! ${_environment[$env]+abc} ]]; then
+              _environment[$env]=${value}
+            else
+              exit_with "Artifact $dep_path does not have a separator set for $env"
+            fi
+          fi
+        done < "$dep_path/ENVIRONMENT"
+      fi
+
+      if [[ -f "$dep_path/BUILD_ENVIRONMENT" ]]; then
+        while read -r line; do
+          local -u env=${line%%=*}
+          local value=${line#*=}
+          if [[ -n "$env" && -n "$value" ]]; then
+            if [[ ${_environment[$env]+abc} && ${env_sep[$env]+abc} ]]; then
+              _environment[$env]=$(join_by ${env_sep[$env]} ${_environment[$env]} ${value})
+            elif [[ ! ${_environment[$env]+abc} ]]; then
+              _environment[$env]=${value}
+            else
+              exit_with "Artifact $dep_path does not have a separator set for $env"
+            fi
+          fi
+        done < "$dep_path/BUILD_ENVIRONMENT"
+      fi
+    else # Look for legacy files
+      if [[ -f "$dep_path/PATH" ]]; then
+        local data=$(cat "$dep_path/PATH")
+        local trimmed=$(trim $data)
+        if [[ ${_environment[PATH]+abc} ]]; then
+            _environment[PATH]=$(join_by ':' ${_environment[PATH]} ${trimmed})
+        else
+            _environment[PATH]=${trimmed}
+        fi
       fi
     fi
   done
   # Insert all the package PATH fragments before the default PATH to ensure
   # package binaries are used before any userland/operating system binaries
-  if [[ -n $path_part ]]; then
-    export PATH="$path_part:$INITIAL_PATH"
+  if [[ ${_environment[PATH]+abc} ]]; then
+    _environment[PATH]=$(join_by ':' ${_environment[PATH]} ${INITIAL_PATH})
   fi
 
-  build_line "Setting PATH=$PATH"
+  # Export out computed environment
+  for env in "${!_environment[@]}"; do
+    build_line "Settings $env=${_environment[$env]}"
+    export ${env}=${_environment[$env]}
+  done
 }
 
-# Download the software from `$pkg_source` and place it in
-# `$HAB_CACHE_SRC_PATH/${$pkg_filename}`. If the source already exists in the
+# If `$pkg_source` is being used, download the software and place it in
+# `$HAB_CACHE_SRC_PATH/$pkg_filename`. If the source already exists in the
 # cache, verify that the checksum is what we expect, and skip the download.
 # Delegates most of the implementation to the `do_default_download()` function.
 do_download() {
@@ -1628,12 +2045,18 @@ do_download() {
 
 # Default implementation for the `do_download()` phase.
 do_default_download() {
+  # If the source is local (and `$pkg_source` is not set) then return, nothing
+  # to do
+  if [[ -z "${pkg_source:-}" ]]; then
+    return 0
+  fi
+
   download_file $pkg_source $pkg_filename $pkg_shasum
 }
 
-# Verify that the package we have in `$HAB_CACHE_SRC_PATH/$pkg_filename` has
-# the `$pkg_shasum` we expect. Delegates most of the implementation to the
-# `do_default_verify()` function.
+# If `$pkg_source` is being used, verify that the package we have in
+# `$HAB_CACHE_SRC_PATH/$pkg_filename` has the `$pkg_shasum` we expect.
+# Delegates most of the implementation to the `do_default_verify()` function.
 do_verify() {
   do_default_verify
   return $?
@@ -1641,7 +2064,9 @@ do_verify() {
 
 # Default implementation for the `do_verify()` phase.
 do_default_verify() {
-  verify_file $pkg_filename $pkg_shasum
+  if [[ -n "${pkg_filename:-}" ]]; then
+    verify_file $pkg_filename $pkg_shasum
+  fi
 }
 
 # Clean up the remnants of any previous build job, ensuring it can't pollute
@@ -1655,12 +2080,13 @@ do_clean() {
 # Default implementation for the `do_clean()` phase.
 do_default_clean() {
   build_line "Clean the cache"
-  rm -rf "$HAB_CACHE_SRC_PATH/$pkg_dirname"
+  rm -rf "$CACHE_PATH"
   return 0
 }
 
-# Takes the `$HAB_CACHE_SRC_PATH/$pkg_filename` from the download step, and
-# unpacks it, as long as the method of extraction can be determined.
+# If `$pkg_source` is being used, we take the
+# `$HAB_CACHE_SRC_PATH/$pkg_filename` from the download step and unpack it,
+# as long as the method of extraction can be determined.
 #
 # This takes place in the $HAB_CACHE_SRC_PATH directory.
 #
@@ -1672,7 +2098,9 @@ do_unpack() {
 
 # Default implementation for the `do_unpack()` phase.
 do_default_unpack() {
-  unpack_file $pkg_filename
+  if [[ -n "${pkg_filename:-}" ]]; then
+    unpack_file $pkg_filename
+  fi
 }
 
 # **Internal** Set up our build environment. First, add any library paths
@@ -1690,26 +2118,20 @@ _build_environment() {
   # overridable) entries only contain **direct** **runtime** paths. If a
   # dependency's lib directory needs to be set in the resulting `RUNPATH`
   # sections of an ELF binary, it must be a direct dependency, not transitive.
-  local ld_run_path_part=""
+  local ld_run_path_part=()
   for lib in "${pkg_lib_dirs[@]}"; do
-    if [[ -z $ld_run_path_part ]]; then
-      ld_run_path_part="$pkg_prefix/$lib"
-    else
-      ld_run_path_part="$ld_run_path_part:$pkg_prefix/$lib"
-    fi
+    ld_run_path_part+=("$pkg_prefix/$lib")
   done
-  export LD_RUN_PATH=$ld_run_path_part
   for dep_path in "${pkg_deps_resolved[@]}"; do
     if [[ -f "$dep_path/LD_RUN_PATH" ]]; then
       local data=$(cat $dep_path/LD_RUN_PATH)
       local trimmed=$(trim $data)
-      if [[ -n "$LD_RUN_PATH" ]]; then
-        export LD_RUN_PATH="$LD_RUN_PATH:$trimmed"
-      else
-        export LD_RUN_PATH="$trimmed"
-      fi
+      ld_run_path_part+=("$trimmed")
     fi
   done
+  if [[ ! -z $ld_run_path_part ]]; then
+    export LD_RUN_PATH=$(join_by ':' ${ld_run_path_part[@]})
+  fi
 
   # Build `$CFLAGS`, `$CPPFLAGS`, `$CXXFLAGS` and `$LDFLAGS` containing any
   # direct dependency's `CFLAGS`, `CPPFLAGS`, `CXXFLAGS` or `LDFLAGS` entries
@@ -1782,8 +2204,8 @@ _build_environment() {
     fi
   done
 
-  # Create a working directory if it doesn't already exist from `do_unpack()`
-  mkdir -pv "$HAB_CACHE_SRC_PATH/$pkg_dirname"
+  # Create a cache directory if it doesn't already exist from `do_unpack()`
+  mkdir -pv "$CACHE_PATH"
 
   # Set PREFIX for maximum default software build support
   export PREFIX=$pkg_prefix
@@ -1801,7 +2223,7 @@ _build_environment() {
 # source to remove the default system search path of `/usr/lib`, etc. when
 # looking for shared libraries.
 _fix_libtool() {
-  find "$HAB_CACHE_SRC_PATH/$pkg_dirname" -iname "ltmain.sh" | while read file; do
+  find "$SRC_PATH" -iname "ltmain.sh" | while read file; do
     build_line "Fixing libtool script $file"
     sed -i -e 's^eval sys_lib_.*search_path=.*^^' "$file"
   done
@@ -1811,7 +2233,7 @@ _fix_libtool() {
 # step is correct, that is inside the extracted source directory.
 do_prepare_wrapper() {
   build_line "Preparing to build"
-  pushd "$HAB_CACHE_SRC_PATH/$pkg_dirname" > /dev/null
+  pushd "$SRC_PATH" > /dev/null
   do_prepare
   popd > /dev/null
 }
@@ -1831,11 +2253,10 @@ do_default_prepare() {
 }
 
 # Since `build` is one of the most overridden functions, this wrapper makes sure
-# that no matter how it is changed, our `$cwd` is
-# `$HAB_CACHE_SRC_PATH/$pkg_dirname`.
+# that no matter how it is changed, our `$cwd` is `$SRC_PATH`.
 do_build_wrapper() {
   build_line "Building"
-  pushd "$HAB_CACHE_SRC_PATH/$pkg_dirname" > /dev/null
+  pushd "$SRC_PATH" > /dev/null
   do_build
   popd > /dev/null
 }
@@ -1875,7 +2296,7 @@ do_default_build() {
 do_check_wrapper() {
   if [[ "$(type -t do_check)" = "function" && -n "$DO_CHECK" ]]; then
     build_line "Running post-compile tests"
-    pushd "$HAB_CACHE_SRC_PATH/$pkg_dirname" > /dev/null
+    pushd "$SRC_PATH" > /dev/null
     do_check
     popd > /dev/null
   fi
@@ -1898,7 +2319,7 @@ do_install_wrapper() {
   for dir in "${pkg_pconfig_dirs[@]}"; do
     mkdir -pv "$pkg_prefix/$dir"
   done
-  pushd "$HAB_CACHE_SRC_PATH/$pkg_dirname" > /dev/null
+  pushd "$SRC_PATH" > /dev/null
   do_install
   popd > /dev/null
 }
@@ -1918,114 +2339,104 @@ do_default_install() {
 # **Internal** Write out the package data to files:
 #
 # * `$pkg_prefix/BUILD_DEPS` - Any dependencies we need build the package
+# * `$pkg_prefix/BUILD_ENVIRONMENT` - A list of build environment keys and their values
 # * `$pkg_prefix/CFLAGS` - Any CFLAGS for things that link against us
 # * `$pkg_prefix/PKG_CONFIG_PATH` - Any PKG_CONFIG_PATH entries for things that depend on us
 # * `$pkg_prefix/DEPS` - Any dependencies we need to use the package at runtime
-# * `$pkg_prefix/EXPOSES` - Any ports we expose
+# * `$pkg_prefix/ENVIRONMENT` - A list of environment keys and their values
+# * `$pkg_prefix/ENVIRONMENT_SEP` - A list of Internal Field Separators for environment keys
+# * `$pkg_prefix/EXPORTS` - A list of exported configuration keys and their public name
+# * `$pkg_prefix/EXPOSES` - An array of `pkg_exports` for which ports that this package exposes
+# * `$pkg_prefix/BINDS` - A list of services you connect to and keys that you expect to be exported
+# * `$pkg_prefix/BINDS_OPTIONAL` - Same as `BINDS` but not required for the service to start
 # * `$pkg_prefix/FILES` - blake2b checksums of all files in the package
 # * `$pkg_prefix/LDFLAGS` - Any LDFLAGS for things that link against us
 # * `$pkg_prefix/LD_RUN_PATH` - The LD_RUN_PATH for things that link against us
-# * `$pkg_prefix/PATH` - Any PATH entries for things that link against us
 _build_metadata() {
   build_line "Building package metadata"
-  local ld_run_path_part=""
-  local ld_lib_part=""
-  for lib in "${pkg_lib_dirs[@]}"; do
-    if [[ -z "$ld_run_path_part" ]]; then
-      ld_run_path_part="${pkg_prefix}/$lib"
-    else
-      ld_run_path_part="$ld_run_path_part:${pkg_prefix}/$lib"
-    fi
-    if [[ -z "$ld_lib_part" ]]; then
-      ld_lib_part="-L${pkg_prefix}/$lib"
-    else
-      ld_lib_part="$ld_lib_part -L${pkg_prefix}/$lib"
-    fi
+  local ld_run_path_part=()
+  local ld_lib_part=()
+  for lib in ${pkg_lib_dirs[@]}; do
+    ld_run_path_part+=("${pkg_prefix}/$lib")
+    ld_lib_part+=("-L${pkg_prefix}/$lib")
   done
-  if [[ -n "${ld_run_path_part}" ]]; then
-    echo $ld_run_path_part > $pkg_prefix/LD_RUN_PATH
+  if [[ -n ${ld_run_path_part} ]]; then
+    echo $(join_by ':' ${ld_run_path_part[@]}) > "$pkg_prefix/LD_RUN_PATH"
   fi
-  if [[ -n "${ld_lib_part}" ]]; then
-    echo $ld_lib_part > $pkg_prefix/LDFLAGS
+  if [[ -n ${ld_lib_part} ]]; then
+    echo $(join_by ' ' ${ld_lib_part[@]}) > "$pkg_prefix/LDFLAGS"
   fi
 
-  local cflags_part=""
+  local cflags_part=()
   for inc in "${pkg_include_dirs[@]}"; do
-    if [[ -z "$cflags_part" ]]; then
-      cflags_part="-I${pkg_prefix}/${inc}"
-    else
-      cflags_part="$cflags_part -I${pkg_prefix}/${inc}"
-    fi
+    cflags_part+=("-I${pkg_prefix}/${inc}")
   done
-  if [[ -n "${cflags_part}" ]]; then
-    echo $cflags_part > $pkg_prefix/CFLAGS
+  if [[ -n ${cflags_part} ]]; then
+    echo $(join_by ' ' ${cflags_part[@]}) > "$pkg_prefix/CFLAGS"
   fi
 
-  local cppflags_part=""
+  local cppflags_part=()
   for inc in "${pkg_include_dirs[@]}"; do
-    if [[ -z "$cppflags_part" ]]; then
-      cppflags_part="-I${pkg_prefix}/${inc}"
-    else
-      cppflags_part="$cppflags_part -I${pkg_prefix}/${inc}"
-    fi
+    cppflags_part+=("-I${pkg_prefix}/${inc}")
   done
-  if [[ -n "${cppflags_part}" ]]; then
-    echo $cppflags_part > $pkg_prefix/CPPFLAGS
+  if [[ -n ${cppflags_part} ]]; then
+    echo $(join_by ' ' ${cppflags_part[@]}) > "$pkg_prefix/CPPFLAGS"
   fi
 
-  local cxxflags_part=""
+  local cxxflags_part=()
   for inc in "${pkg_include_dirs[@]}"; do
-    if [[ -z "$cxxflags_part" ]]; then
-      cxxflags_part="-I${pkg_prefix}/${inc}"
-    else
-      cxxflags_part="$cxxflags_part -I${pkg_prefix}/${inc}"
-    fi
+    cxxflags_part+=("-I${pkg_prefix}/${inc}")
   done
-  if [[ -n "${cxxflags_part}" ]]; then
-    echo $cxxflags_part > $pkg_prefix/CXXFLAGS
+  if [[ -n ${cxxflags_part} ]]; then
+    echo $(join_by ' ' ${cxxflags_part[@]}) > "$pkg_prefix/CXXFLAGS"
   fi
 
-  local pconfig_path_part=""
+  local pconfig_path_part=()
   if [ ${#pkg_pconfig_dirs[@]} -eq 0 ]; then
     # Plan doesn't define pkg-config paths so let's try to find them in the conventional locations
     local locations=(lib/pkgconfig share/pkgconfig)
     for dir in "${locations[@]}"; do
       if [[ -d "${pkg_prefix}/${dir}" ]]; then
-        if [[ -z "$pconfig_path_part" ]]; then
-          pconfig_path_part="${pkg_prefix}/${dir}"
-        else
-          pconfig_path_part="${pconfig_path_part}:${pkg_prefix}/${dir}"
-        fi
+        pconfig_path_part+=("${pkg_prefix}/${dir}")
       fi
     done
   else
     # Plan explicitly defines pkg-config paths so we don't provide defaults
     for inc in "${pkg_pconfig_dirs[@]}"; do
-      if [[ -z "$pconfig_path_part" ]]; then
-        pconfig_path_part="${pkg_prefix}/${inc}"
-      else
-        pconfig_path_part="${pconfig_path_part}:${pkg_prefix}/${inc}"
-      fi
+      pconfig_path_part+=("${pkg_prefix}/${inc}")
     done
   fi
-  if [[ -n "${pconfig_path_part}" ]]; then
-    echo $pconfig_path_part > $pkg_prefix/PKG_CONFIG_PATH
+  if [[ -n ${pconfig_path_part} ]]; then
+    echo $(join_by ':' ${pconfig_path_part[@]}) > "$pkg_prefix/PKG_CONFIG_PATH"
   fi
 
-  local path_part=""
-  for bin in "${pkg_bin_dirs[@]}"; do
-    if [[ -z "$path_part" ]]; then
-      path_part="${pkg_prefix}/${bin}";
-    else
-      path_part="$path_part:${pkg_prefix}/${bin}";
-    fi
+  for env in ${!pkg_build_env[@]}; do
+    echo "$env=${pkg_build_env[$env]}" >> "$pkg_prefix/BUILD_ENVIRONMENT"
   done
-  if [[ -n "${path_part}" ]]; then
-    echo $path_part > $pkg_prefix/PATH
+
+  for env in ${!pkg_env[@]}; do
+    echo "$env=${pkg_env[$env]}" >> "$pkg_prefix/ENVIRONMENT"
+  done
+
+  for env_sep in ${!pkg_env_sep[@]}; do
+    echo "$env_sep=${pkg_env_sep[$env_sep]}" >> "$pkg_prefix/ENVIRONMENT_SEP"
+  done
+
+  # Create PATH metadata for older versions of Habitat
+  if [ ${pkg_env[PATH]+abc} ]; then
+    echo "${pkg_env[PATH]}" > "$pkg_prefix/PATH"
   fi
 
   for export in "${!pkg_exports[@]}"; do
     echo "$export=${pkg_exports[$export]}" >> $pkg_prefix/EXPORTS
+  done
+
+  for bind in "${!pkg_binds[@]}"; do
+    echo "$bind=${pkg_binds[$bind]}" >> $pkg_prefix/BINDS
+  done
+
+  for bind in "${!pkg_binds_optional[@]}"; do
+    echo "$bind=${pkg_binds_optional[$bind]}" >> $pkg_prefix/BINDS_OPTIONAL
   done
 
   local port_part=""
@@ -2087,11 +2498,11 @@ _build_metadata() {
 
   # Generate the blake2b hashes of all the files in the package. This
   # is not in the resulting MANIFEST because MANIFEST is included!
-  pushd "$HAB_CACHE_SRC_PATH/$pkg_dirname" > /dev/null
+  pushd "$CACHE_PATH" > /dev/null
   build_line "Generating blake2b hashes of all files in the package"
   find $pkg_prefix -type f \
     | $_sort_cmd \
-    | while read file; do _b2sum "$file"; done > ${pkg_name}_blake2bsums
+    | hab pkg hash > ${pkg_name}_blake2bsums
 
   build_line "Generating signed metadata FILES"
   $HAB_BIN pkg sign --origin $pkg_origin ${pkg_name}_blake2bsums $pkg_prefix/FILES
@@ -2217,6 +2628,12 @@ _build_manifest() {
     local _upstream_url_string="[$pkg_upstream_url]($pkg_upstream_url)"
   fi
 
+  if [[ -z $pkg_source ]]; then
+    local _source_url_string="source URL not provided or required"
+  else
+    local _source_url_string="[$pkg_source]($pkg_source)"
+  fi
+
   if [[ -z $pkg_shasum ]]; then
     local _sha_string="SHA256 checksum not provided or required"
   else
@@ -2283,7 +2700,7 @@ $pkg_description
 * __Target__: $pkg_target
 * __Upstream URL__: $_upstream_url_string
 * __License__: $(printf "%s " ${pkg_license[@]})
-* __Source__: [$pkg_source]($pkg_source)
+* __Source__: $_source_url_string
 * __SHA__: $_sha_string
 * __Path__: \`$pkg_prefix\`
 * __Build Dependencies__: $_build_deps_string
@@ -2311,17 +2728,6 @@ EOT
   return 0
 }
 
-# **Internal** Generate the blake2b checksum and output similar to
-# `sha256sum`.
-#
-# TODO: (jtimberman) If `hab pkg hash` itself starts to output
-# like `sha256sum` at some point, we'll need to update this function.
-_b2sum() {
-  local filename="$1"
-  local hash_val=$(hab pkg hash "$filename")
-  echo -en "$hash_val  $filename\n"
-}
-
 # **Internal** Create the package artifact with `tar`/`hab pkg sign`
 _generate_artifact() {
   build_line "Generating package artifact"
@@ -2338,7 +2744,7 @@ _generate_artifact() {
 
 _prepare_build_outputs() {
   _pkg_sha256sum=$($_shasum_cmd $pkg_artifact | cut -d " " -f 1)
-  _pkg_blake2bsum=$($HAB_BIN pkg hash $pkg_artifact)
+  _pkg_blake2bsum=$($HAB_BIN pkg hash $pkg_artifact | cut -d " " -f 1)
   mkdir -pv "$pkg_output_path"
   cp -v "$pkg_artifact" "$pkg_output_path"/
 
@@ -2388,6 +2794,10 @@ done
 
 # Expand the context path to an absolute path
 PLAN_CONTEXT="$(abspath "$PLAN_CONTEXT")"
+# Set the initial source root to be the same as the Plan context directory.
+# This assumes that your application source is local and your Plan exists with
+# your code.
+SRC_PATH="$PLAN_CONTEXT"
 # Expand the path of this program to an absolute path
 THIS_PROGRAM=$(abspath "$0")
 
@@ -2439,7 +2849,6 @@ build_line "Validating plan metadata"
 required_variables=(
   pkg_name
   pkg_origin
-  pkg_source
   pkg_version
 )
 for var in "${required_variables[@]}"
@@ -2450,10 +2859,12 @@ do
 done
 
 # Test to ensure package name contains only valid characters
-if [[ ! "${pkg_name}" =~ ^[A-Za-z0-9_-]+$ ]];
-then
-  exit_with "Failed to build. Package name '${pkg_name}' contains invalid characters." 1
-fi
+for var in pkg_name pkg_origin; do
+  if [[ ! "${!var}" =~ ^[A-Za-z0-9_-]+$ ]];
+  then
+    exit_with "Failed to build. Package $var '${!var}' contains invalid characters." 1
+  fi
+done
 
 # Pass over `$pkg_svc_run` to replace any `$pkg_name` placeholder tokens
 # from prior pkg_svc_* variables that were set before the Plan was loaded.
@@ -2461,21 +2872,30 @@ if [[ -n "${pkg_svc_run+xxx}" ]]; then
   pkg_svc_run="$(echo $pkg_svc_run | sed "s|@__pkg_name__@|$pkg_name|g")"
 fi
 
-# Set `$pkg_filename` to the basename of `$pkg_source`, if it is not already
-# set by the `plan.sh`.
-if [[ -z "${pkg_filename+xxx}" ]]; then
+# If `$pkg_source` is used, default `$pkg_filename` to the basename of
+# `$pkg_source` if it is not already set by the Plan.
+if [[ -n "${pkg_source:-}" && -z "${pkg_filename+xxx}" ]]; then
   pkg_filename="$(basename "$pkg_source")"
 fi
 
 # Set `$pkg_dirname` to the `$pkg_name` and `$pkg_version`, if it is not
-# already set by the `plan.sh`.
+# already set by the Plan.
 if [[ -z "${pkg_dirname+xxx}" ]]; then
   pkg_dirname="${pkg_name}-${pkg_version}"
 fi
 
-# Set `$pkg_prefix` if not already set by the `plan.sh`.
+# Set `$pkg_prefix` if not already set by the Plan.
 if [[ -z "${pkg_prefix+xxx}" ]]; then
   pkg_prefix=$HAB_PKG_PATH/${pkg_origin}/${pkg_name}/${pkg_version}/${pkg_release}
+fi
+
+# Set the cache path to be under the cache source root path
+CACHE_PATH="$HAB_CACHE_SRC_PATH/$pkg_dirname"
+
+# If `$pkg_source` is used, update the source path to build under the cache
+# source path.
+if [[ -n "${pkg_source:-}" ]]; then
+  SRC_PATH="$CACHE_PATH"
 fi
 
 if [[ -n "$HAB_OUTPUT_PATH" ]]; then
@@ -2509,10 +2929,10 @@ _ensure_origin_key_present
 
 _determine_hab_bin
 
-# Download and resolve the dependencies
 _resolve_dependencies
 
-_set_path
+# Set up runtime environment
+_set_environment
 
 # Download the source
 mkdir -pv "$HAB_CACHE_SRC_PATH"
@@ -2572,7 +2992,7 @@ do_end
 
 # Print the results
 build_line
-build_line "Source Cache: $HAB_CACHE_SRC_PATH/$pkg_dirname"
+build_line "Source Path: $SRC_PATH"
 build_line "Installed Path: $pkg_prefix"
 build_line "Artifact: $pkg_output_path/$(basename "$pkg_artifact")"
 build_line "Build Report: $pkg_output_path/last_build.env"

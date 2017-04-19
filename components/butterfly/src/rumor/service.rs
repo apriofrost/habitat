@@ -22,7 +22,7 @@ use std::ops::{Deref, DerefMut};
 
 use habitat_core::service::ServiceGroup;
 use habitat_core::package::Identifiable;
-use protobuf::Message;
+use protobuf::{self, Message};
 use toml;
 
 use error::Result;
@@ -79,13 +79,14 @@ impl DerefMut for Service {
 
 impl Service {
     /// Creates a new Service.
-    pub fn new<T>(member_id: String,
-                  package: &T,
-                  service_group: &ServiceGroup,
-                  sys: &SysInfo,
-                  cfg: Option<&toml::Table>)
-                  -> Result<Self>
-        where T: Identifiable
+    pub fn new<T, U>(member_id: U,
+                     package: &T,
+                     service_group: &ServiceGroup,
+                     sys: &SysInfo,
+                     cfg: Option<&toml::value::Table>)
+                     -> Self
+        where T: Identifiable,
+              U: Into<String>
     {
         assert!(package.fully_qualified(),
                 "Service constructor requires a fully qualified package identifier");
@@ -94,25 +95,34 @@ impl Service {
                    "Service constructor requires the given package name to match the service \
                     group's name");
         let mut rumor = ProtoRumor::new();
-        rumor.set_from_id(member_id.clone());
+        rumor.set_from_id(member_id.into());
         rumor.set_field_type(ProtoRumor_Type::Service);
 
         let mut proto = ProtoService::new();
-        proto.set_member_id(member_id);
+        proto.set_member_id(rumor.get_from_id().to_string());
         proto.set_service_group(service_group.to_string());
         proto.set_incarnation(0);
         proto.set_pkg(package.to_string());
-        proto.set_sys(toml::encode_str(&sys).into_bytes());
+        // TODO FN: Can we really expect this all the time, should we return a `Result<Self>` in
+        // this constructor?
+        proto.set_sys(toml::ser::to_vec(&sys).expect("Struct should serialize to bytes"));
         if let Some(cfg) = cfg {
-            proto.set_cfg(toml::encode_str(cfg).into_bytes());
+            // TODO FN: Can we really expect this all the time, should we return a `Result<Self>`
+            // in this constructor?
+            proto.set_cfg(toml::ser::to_vec(cfg).expect("Struct should serialize to bytes"));
         }
 
         rumor.set_service(proto);
-        Ok(Service(rumor))
+        Service(rumor)
     }
 }
 
 impl Rumor for Service {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let rumor = protobuf::parse_from_bytes::<ProtoRumor>(bytes)?;
+        Ok(Service::from(rumor))
+    }
+
     /// Follows a simple pattern; if we have a newer incarnation than the one we already have, the
     /// new one wins. So far, these never change.
     fn merge(&mut self, mut other: Service) -> bool {
@@ -145,8 +155,14 @@ impl Rumor for Service {
 pub struct SysInfo {
     pub ip: String,
     pub hostname: String,
+    pub gossip_ip: String,
+    // TODO: revert to u16 when deserializing in the handlebars template
+    // works properly
+    pub gossip_port: String,
     pub http_gateway_ip: String,
-    pub http_gateway_port: u16,
+    // TODO: revert to u16 when deserializing in the handlebars template
+    // works properly
+    pub http_gateway_port: String,
 }
 
 #[cfg(test)]
@@ -164,7 +180,7 @@ mod tests {
     fn create_service(member_id: &str) -> Service {
         let pkg = PackageIdent::from_str("core/neurosis/1.2.3/20161208121212").unwrap();
         let sg = ServiceGroup::new(pkg.name(), "production", None).unwrap();
-        Service::new(member_id.to_string(), &pkg, &sg, &SysInfo::default(), None).unwrap()
+        Service::new(member_id.to_string(), &pkg, &sg, &SysInfo::default(), None)
     }
 
     #[test]
@@ -254,7 +270,6 @@ mod tests {
                      &ident,
                      &sg,
                      &SysInfo::default(),
-                     None)
-            .unwrap();
+                     None);
     }
 }

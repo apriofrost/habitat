@@ -72,12 +72,12 @@ impl ApiClient {
                fs_root_path: Option<&Path>)
                -> Result<Self> {
         Ok(ApiClient {
-            endpoint: endpoint.clone(),
-            inner: try!(new_hyper_client(Some(endpoint), fs_root_path)),
-            proxy: try!(proxy_unless_domain_exempted(Some(endpoint))),
-            target_scheme: endpoint.scheme().to_string(),
-            user_agent_header: try!(user_agent(product, version)),
-        })
+               endpoint: endpoint.clone(),
+               inner: try!(new_hyper_client(Some(endpoint), fs_root_path)),
+               proxy: try!(proxy_unless_domain_exempted(Some(endpoint))),
+               target_scheme: endpoint.scheme().to_string(),
+               user_agent_header: try!(user_agent(product, version)),
+           })
     }
 
     /// Builds an HTTP GET request for a given path.
@@ -301,6 +301,7 @@ fn ssl_connector(fs_root_path: Option<&Path>) -> Result<SslConnector> {
     options.toggle(SSL_OP_NO_COMPRESSION);
     try!(ssl::set_ca(conn.builder_mut(), fs_root_path));
     conn.builder_mut().set_options(options);
-    try!(conn.builder_mut().set_cipher_list("ALL!EXPORT!EXPORT40!EXPORT56!aNULL!LOW!RC4@STRENGTH"));
+    try!(conn.builder_mut()
+             .set_cipher_list("ALL!EXPORT!EXPORT40!EXPORT56!aNULL!LOW!RC4@STRENGTH"));
     Ok(conn.build())
 }

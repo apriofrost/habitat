@@ -7,5 +7,9 @@ if [[ "${TRAVIS_PULL_REQUEST}" = "false" ]] && [[ "${TRAVIS_BRANCH}" = "master" 
   cd www
   make deploy
 else
-  echo "We are either on a PR or a branch other than master. Doing nothing."
+  if [[ "${TRAVIS_PULL_REQUEST}" = "false" ]] && [[ "${TRAVIS_BRANCH}" =~ ^acceptance_deploy ]]; then
+    echo "We are on a PR or against the master branch. Deploying to Acceptance."
+    cd www
+    make acceptance
+  fi
 fi

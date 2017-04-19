@@ -25,6 +25,7 @@ use toml;
 
 use error::{Error, Result};
 
+#[derive(Debug)]
 pub struct Config {
     /// List of net addresses for routing servers to connect to
     pub routers: Vec<SocketAddr>,
@@ -32,6 +33,8 @@ pub struct Config {
     pub worker_command_addr: SocketAddr,
     /// Listening net address for heartbeat traffic from Workers.
     pub worker_heartbeat_addr: SocketAddr,
+    /// Publishing net address for job status updates
+    pub status_publisher_addr: SocketAddr,
     /// PostgreSQL connection URL
     pub datastore_connection_url: String,
     /// Timing to retry the connection to the data store if it cannot be established
@@ -57,7 +60,9 @@ impl Default for Config {
             worker_command_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 5566)),
             worker_heartbeat_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0),
                                                                     5567)),
-            datastore_connection_url: String::from("postgresql:://hab@127.0.0.1/builder_db_test"),
+            status_publisher_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0),
+                                                                    5568)),
+            datastore_connection_url: String::from("postgresql://hab@127.0.0.1/builder_jobsrv"),
             datastore_connection_retry_ms: 300,
             datastore_connection_timeout: Duration::from_secs(3600),
             datastore_connection_test: false,
@@ -77,11 +82,12 @@ impl ConfigFile for Config {
         try!(toml.parse_into("cfg.routers", &mut cfg.routers));
         try!(toml.parse_into("cfg.worker_command_addr", &mut cfg.worker_command_addr));
         try!(toml.parse_into("cfg.worker_heartbeat_addr", &mut cfg.worker_heartbeat_addr));
-        let mut connection_user = String::new();
+        try!(toml.parse_into("cfg.status_publisher_addr", &mut cfg.status_publisher_addr));
+        let mut connection_user = String::from("hab");
         try!(toml.parse_into("cfg.datastore_connection_user", &mut connection_user));
-        let mut connection_address = String::new();
+        let mut connection_address = String::from("127.0.0.1");
         try!(toml.parse_into("cfg.datastore_connection_address", &mut connection_address));
-        let mut connection_db = String::new();
+        let mut connection_db = String::from("builder_jobsrv");
         try!(toml.parse_into("cfg.datastore_connection_db", &mut connection_db));
 
         cfg.datastore_connection_url = format!("postgresql://{}@{}/{}",
@@ -90,7 +96,7 @@ impl ConfigFile for Config {
                                                connection_db);
         try!(toml.parse_into("cfg.datastore_connection_retry_ms",
                              &mut cfg.datastore_connection_retry_ms));
-        let mut timeout_seconds = 0;
+        let mut timeout_seconds = 3600;
         try!(toml.parse_into("cfg.datastore_connection_timeout", &mut timeout_seconds));
         cfg.datastore_connection_timeout = Duration::from_secs(timeout_seconds);
         try!(toml.parse_into("cfg.pool_size", &mut cfg.pool_size));

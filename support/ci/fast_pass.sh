@@ -7,11 +7,16 @@
 # .travis.yml in the `before_install`, we exit non-zero if we want the build to
 # be skipped, so we can do `|| exit 0` in the YAML.
 
+echo "TAG: $TRAVIS_TAG"
+echo "VERSION: $(cat VERSION)"
+
 if [ -n "$STEAM_ROLLER" ]; then
   echo 'STEAM_ROLLER is set. Not exiting and running everything.'
 elif [ -z "$AFFECTED_DIRS" ]; then
   # Don't do anything if $AFFECTED_DIRS is not set
   echo 'AFFECTED_DIRS is not set. Not exiting and running everything.'
+elif [ "$(cat VERSION)" == "$TRAVIS_TAG" ]; then
+  echo "This is a release tag. Congrats on the new  $TRAVIS_TAG release!!"
 else
   # If $AFFECTED_DIRS (a "|" separated list of directories) is set, see if we have
   # any changes

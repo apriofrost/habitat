@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {Component} from "@angular/core";
-import {RouterLink} from "@angular/router";
-import {isPackage, packageString} from "../util";
+import { Component, Input } from "@angular/core";
+import { isPackage, packageString } from "../util";
 
 @Component({
-    inputs: ["currentPackage", "packages"],
-    directives: [RouterLink],
-    selector: "package-list",
+    selector: "hab-package-list",
     template: `
     <ul class="hab-package-list">
         <li *ngIf="!packages || packages.length === 0">None</li>
@@ -32,8 +29,9 @@ import {isPackage, packageString} from "../util";
 })
 
 export class PackageListComponent {
-    private currentPackage: Object;
-    private packages: Array<Object>;
-    private isPackage(x, y) { return isPackage(x, y); }
-    private packageString(pkg) { return packageString(pkg); }
+    @Input() currentPackage: Object;
+    @Input() packages: Array<Object>;
+
+    isPackage(x, y) { return isPackage(x, y); }
+    packageString(pkg) { return packageString(pkg); }
 }
